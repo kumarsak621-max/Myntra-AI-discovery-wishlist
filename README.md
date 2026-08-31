@@ -148,7 +148,9 @@ score = reach × frequency × purchase_impact × severity × evidence_confidence
 
 Each dimension is 1–5.
 
-Analysis is cached by review content hash. Unchanged reviews are not sent to the model again.
+AI analysis is cached by review content hash. Unchanged reviews are not sent to the model again. New reviews are stored as `pending` and only those rows are analyzed (in batches of `AI_ANALYSIS_BATCH_SIZE`, default 60, so Streamlit Cloud requests do not time out). Click **Run Full Discovery Pipeline** again to continue pending reviews.
+
+If discovery pages say analysis has not run, that means reviews are stored but `OPENROUTER_API_KEY` is missing or analysis has not been executed yet — not that there are zero reviews.
 
 ## Dashboard
 

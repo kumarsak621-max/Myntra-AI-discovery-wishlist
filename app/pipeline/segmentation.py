@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections import defaultdict
 
 from sqlalchemy.orm import Session
 
 from app.models import Review, Segment, utcnow
+
+logger = logging.getLogger(__name__)
 
 
 def _loads(raw: str) -> list:
@@ -66,6 +69,16 @@ RULES = [
         lambda a, signals, intents: a.wishlist_signal in {"explicit", "implicit"}
         or any("wishlist" in i.lower() or "save" in i.lower() for i in intents),
     ),
+    (
+        "Fit-sensitive shoppers",
+        "inferred",
+        "Users whose reviews mention size, fit, or measurement uncertainty.",
+        lambda a, signals, intents: "size_checking" in signals
+        or any(
+            k in " ".join(intents + _loads(a.barriers_json) + _loads(a.uncertainties_json)).lower()
+            for k in ("size", "fit", "measurement", "chart")
+        ),
+    ),
 ]
 
 
@@ -102,7 +115,8 @@ def discover_segments(db: Session) -> list[Segment]:
         for name, basis, description, matcher in RULES:
             try:
                 matched = bool(matcher(analysis, signals, intents))
-            except Exception:
+            except Exception as exc:
+                logger.warning("Segment matcher failed for %s: %s", name, exc)
                 matched = False
             if not matched:
                 continue

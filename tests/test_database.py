@@ -102,6 +102,35 @@ def test_duplicate_insert_is_skipped(db):
     assert db.query(Review).count() == 1
 
 
+def test_database_diagnostics_counts_pending(db):
+    from app.database import get_database_diagnostics
+    from app.models import Analysis
+
+    settings = Settings(collection_rate_limit_seconds=0)
+    collector = GooglePlayCollector(settings=settings)
+    validation = validate_app_identity(
+        platform="google_play",
+        app_id="com.myntra.android",
+        detected_app_name="Myntra",
+        detected_developer="Myntra Designs Private Limited",
+    )
+    item = NormalizedReview(
+        source="google_play",
+        source_review_id="diag-1",
+        app_id="com.myntra.android",
+        app_name="Myntra",
+        text="Saved to wishlist but size is unclear so I did not buy.",
+        is_valid_source=True,
+        data_classification="MYNTRA EVIDENCE",
+    )
+    collector.save_raw(db, [item], validation)
+    diag = get_database_diagnostics(db)
+    assert diag["google_play_reviews"] == 1
+    assert diag["pending_reviews"] >= 1
+    assert diag["analyzed_reviews"] == 0
+    assert db.query(Analysis).count() == 1
+
+
 def test_empty_review_is_rejected(db):
     collector = GooglePlayCollector(settings=Settings(collection_rate_limit_seconds=0))
     validation = validate_app_identity(

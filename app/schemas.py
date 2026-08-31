@@ -68,6 +68,9 @@ class CollectionStats(BaseModel):
     mode: str = ""
     window_start: datetime | None = None
     in_window: int = 0
+    analysis_error: str = ""
+    analysis_failed: int = 0
+    pending_remaining: int = 0
 
 
 class InformationSeekingItem(BaseModel):

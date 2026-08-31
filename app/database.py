@@ -70,6 +70,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     migrate_schema()
     quarantine_non_myntra_records()
+    ensure_pending_analysis_rows()
 
 
 def migrate_schema() -> None:
@@ -116,6 +117,140 @@ def quarantine_non_myntra_records() -> int:
     finally:
         db.close()
     return changed
+
+
+def ensure_pending_analysis_rows() -> int:
+    """Queue Myntra-valid reviews that were stored before pending Analysis rows existed."""
+    from app.models import Analysis, Review
+    from app.pipeline.analysis import ANALYSIS_VERSION
+    from config.settings import official_ids
+
+    db = SessionLocal()
+    created = 0
+    try:
+        rows = (
+            db.query(Review)
+            .filter(
+                Review.is_empty.is_(False),
+                Review.is_valid_source.is_(True),
+                Review.app_id.in_(list(official_ids())),
+            )
+            .all()
+        )
+        for row in rows:
+            if row.analysis is not None:
+                continue
+            db.add(
+                Analysis(
+                    review_id=row.id,
+                    content_hash=row.content_hash or "",
+                    status="pending",
+                    analysis_version=ANALYSIS_VERSION,
+                )
+            )
+            created += 1
+        if created:
+            db.commit()
+    finally:
+        db.close()
+    return created
+
+
+def get_database_diagnostics(db: Session | None = None) -> dict[str, Any]:
+    """Counts for collection vs analysis. Uses review timestamps for the 30-day window."""
+    from app.models import Analysis, Opportunity, Review, Segment, Theme
+    from app.pipeline.dates import get_last_30_days_cutoff
+    from config.settings import OFFICIAL_APPLE_APP_ID, OFFICIAL_GOOGLE_PLAY_APP_ID, official_ids
+
+    owns = db is None
+    session = db or SessionLocal()
+    try:
+        cutoff = get_last_30_days_cutoff()
+        from app.pipeline.quantification import review_query
+
+        all_q = review_query(session, myntra_only=False)
+        myntra_q = review_query(session, myntra_only=True)
+        window_q = review_query(session, myntra_only=True, since=cutoff)
+        gp = (
+            session.query(Review)
+            .filter(
+                Review.source == "google_play",
+                Review.app_id == OFFICIAL_GOOGLE_PLAY_APP_ID,
+                Review.is_empty.is_(False),
+                Review.is_duplicate.is_(False),
+            )
+            .count()
+        )
+        apple = (
+            session.query(Review)
+            .filter(
+                Review.source == "apple_app_store",
+                Review.app_id == OFFICIAL_APPLE_APP_ID,
+                Review.is_empty.is_(False),
+                Review.is_duplicate.is_(False),
+            )
+            .count()
+        )
+        myntra_ids = list(official_ids())
+        pending = (
+            session.query(Analysis)
+            .join(Review)
+            .filter(
+                Analysis.status == "pending",
+                Review.is_valid_source.is_(True),
+                Review.app_id.in_(myntra_ids),
+            )
+            .count()
+        )
+        no_row = (
+            session.query(Review)
+            .filter(
+                Review.is_valid_source.is_(True),
+                Review.app_id.in_(myntra_ids),
+                Review.is_empty.is_(False),
+                Review.analysis == None,  # noqa: E711
+            )
+            .count()
+        )
+        analyzed = (
+            session.query(Analysis)
+            .join(Review)
+            .filter(
+                Analysis.status == "analyzed",
+                Analysis.is_valid_json.is_(True),
+                Review.is_valid_source.is_(True),
+                Review.app_id.in_(myntra_ids),
+            )
+            .count()
+        )
+        failed = (
+            session.query(Analysis)
+            .join(Review)
+            .filter(
+                Analysis.status == "failed",
+                Review.is_valid_source.is_(True),
+                Review.app_id.in_(myntra_ids),
+            )
+            .count()
+        )
+        path = sqlite_path()
+        return {
+            "database_path": str(path) if path else "",
+            "total_reviews": all_q.count(),
+            "myntra_reviews": myntra_q.count(),
+            "google_play_reviews": gp,
+            "apple_reviews": apple,
+            "last_30_day_reviews": window_q.count(),
+            "pending_reviews": pending + no_row,
+            "analyzed_reviews": analyzed,
+            "failed_reviews": failed,
+            "themes": session.query(Theme).count(),
+            "segments": session.query(Segment).count(),
+            "opportunities": session.query(Opportunity).count(),
+        }
+    finally:
+        if owns:
+            session.close()
 
 
 def get_review_count(db: Session | None = None, *, since=None, myntra_only: bool = False) -> int:

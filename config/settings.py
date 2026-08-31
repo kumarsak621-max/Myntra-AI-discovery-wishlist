@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+import logging
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -63,6 +64,7 @@ class Settings(BaseSettings):
 
     ai_max_review_chars: int = 4000
     ai_rate_limit_seconds: float = 0.4
+    ai_analysis_batch_size: int = 60
 
     host: str = "127.0.0.1"
     port: int = 8000
@@ -113,6 +115,8 @@ def _streamlit_secret(name: str) -> str | None:
         text = str(value).strip()
         return text or None
     except Exception:
+        logger = logging.getLogger(__name__)
+        logger.debug("Streamlit secrets are not available in this process")
         return None
 
 

@@ -20,6 +20,8 @@ from config.settings import official_ids
 
 ANALYSIS_VERSION = "1"
 
+logger = logging.getLogger(__name__)
+
 ProgressCallback = Callable[[dict[str, Any]], None]
 
 
@@ -128,6 +130,7 @@ def analyze_new_reviews(
     settings = get_settings()
     provider = provider or AIProvider(settings)
     pending = reviews_needing_analysis(db)
+    total_pending = len(pending)
     if limit is not None:
         pending = pending[:limit]
 
@@ -145,13 +148,13 @@ def analyze_new_reviews(
 
     if not provider.available():
         message = (
-            "AI credentials are not configured. Reviews are stored but not analyzed. "
-            "Set OPENROUTER_API_KEY in Streamlit Secrets or .env."
+            "AI analysis failed: OPENROUTER_API_KEY is not set in Streamlit Secrets or .env. "
+            f"{total_pending} real Myntra-valid reviews are waiting for analysis."
         )
-        logger.warning(message)
+        logger.error(message)
         if progress:
             progress({"stage": "analysis", "status": "error", "message": message})
-        return 0
+        raise AIError(message)
 
     analyzed = 0
     for index, review in enumerate(pending, start=1):

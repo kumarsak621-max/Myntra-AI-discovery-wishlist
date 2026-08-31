@@ -35,6 +35,7 @@ class CollectionEngine:
         analyze: bool = True,
         mode: str = "latest",
         progress: ProgressCallback | None = None,
+        analyze_limit: int | None = None,
     ) -> CollectionStats:
         wanted = sources or ["google_play", "apple_app_store"]
         cutoff = None
@@ -182,10 +183,35 @@ class CollectionEngine:
             if analyze:
                 if progress:
                     progress({"stage": "analysis", "status": "start"})
+                from app.ai.provider import AIError
                 from app.pipeline.orchestrator import run_analysis_pipeline
 
-                analyzed = run_analysis_pipeline(self.db, progress=progress)
-                combined.analyzed = analyzed
+                limit = (
+                    analyze_limit
+                    if analyze_limit is not None
+                    else self.settings.ai_analysis_batch_size
+                )
+                try:
+                    analyzed = run_analysis_pipeline(self.db, progress=progress, analyze_limit=limit)
+                    combined.analyzed = analyzed
+                    if analyzed == 0 and self.settings.has_ai_credentials:
+                        from app.pipeline.analysis import reviews_needing_analysis
+
+                        leftover = len(reviews_needing_analysis(self.db))
+                        combined.pending_remaining = leftover
+                except AIError as exc:
+                    msg = str(exc)
+                    logger.error(msg)
+                    combined.errors.append(msg)
+                    combined.analysis_error = msg
+                except Exception as exc:
+                    msg = f"AI analysis failed: {exc}"
+                    logger.exception(msg)
+                    combined.errors.append(msg)
+                    combined.analysis_error = msg
+            from app.pipeline.analysis import reviews_needing_analysis
+
+            combined.pending_remaining = len(reviews_needing_analysis(self.db))
 
             combined.source_validations = validations
             combined.duration_seconds = round(time.monotonic() - started, 2)

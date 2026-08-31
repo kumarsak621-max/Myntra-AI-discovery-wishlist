@@ -399,6 +399,50 @@ def root_cause_distribution(
     ]
 
 
+def problem_rows(db: Session, *, myntra_only: bool = True, since: datetime | None = None) -> list[dict[str, Any]]:
+    """Aggregate root causes with frequency, severity, and purchase impact from real analyses."""
+    from app.models import Analysis
+    from app.pipeline.scoring import purchase_impact_from_hesitation, severity_from_strength
+
+    dist = root_cause_distribution(db, myntra_only=myntra_only, since=since)
+    out = []
+    for item in dist:
+        ids = item.get("review_ids") or []
+        analyses = (
+            db.query(Analysis)
+            .filter(Analysis.review_id.in_(ids), Analysis.is_valid_json.is_(True))
+            .all()
+            if ids
+            else []
+        )
+        strengths = [a.evidence_strength for a in analyses if a.evidence_strength]
+        ratings = []
+        hesitant = 0
+        for analysis in analyses:
+            review = analysis.review
+            if review is not None and review.rating is not None:
+                ratings.append(review.rating)
+            if analysis.purchase_hesitation in {"explicit", "implicit"}:
+                hesitant += 1
+        out.append(
+            {
+                "problem": item["label"],
+                "frequency": item["count"],
+                "percentage": item["percentage"],
+                "denominator": item["denominator"],
+                "severity": severity_from_strength(strengths, ratings),
+                "purchase_impact": purchase_impact_from_hesitation(hesitant, item["count"]),
+                "supporting_reviews": item["count"],
+                "review_ids": ids,
+                "confidence": round(sum(a.confidence for a in analyses) / len(analyses), 2) if analyses else None,
+                "analysis_timestamp": max((a.analyzed_at for a in analyses if a.analyzed_at), default=None),
+                "model": next((a.model for a in analyses if a.model), ""),
+                "analysis_version": next((a.analysis_version for a in analyses if a.analysis_version), ""),
+            }
+        )
+    return out
+
+
 def source_live_status(db: Session) -> dict[str, Any]:
     """Freshness for official Myntra sources. Never claims a live stream."""
     from app.models import CollectionRun, Source

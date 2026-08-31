@@ -14,13 +14,14 @@ import streamlit as st
 from sqlalchemy.orm import Session
 
 from app.api.routes import serialize_review
-from app.database import SessionLocal, get_review_count, get_review_stats, init_db, sqlite_path
+from app.database import SessionLocal, get_database_diagnostics, get_review_count, get_review_stats, init_db, sqlite_path
 from app.models import Analysis, CollectionRun, Opportunity, Review, Segment, Theme
 from app.pipeline.dates import get_last_30_days_cutoff, humanize_ago, window_start
 from app.pipeline.quantification import (
     daily_review_trends,
     label_distribution,
     label_window_momentum,
+    problem_rows,
     source_live_status,
 )
 from app.pipeline.report import build_report, evidence_cards
@@ -56,6 +57,29 @@ PAGES = [
 EMPTY = "No reviews have been collected yet."
 NO_ANALYSIS = "Not enough real feedback collected for analysis."
 NEAR_REALTIME = "Near-real-time — refreshed from the public source"
+
+
+def _analysis_blocker(*, stored: int, analyzed: int, pending: int, failed: int, ai_ok: bool) -> str | None:
+    """Explain why discovery pages are empty. Never hide stored reviews behind a fake empty corpus."""
+    if stored == 0:
+        return EMPTY
+    if analyzed > 0:
+        return None
+    if not ai_ok:
+        return (
+            f"{stored} real reviews are stored, but none have been analyzed. "
+            "AI analysis failed: OPENROUTER_API_KEY is not set in Streamlit Secrets or .env. "
+            "Set the key, then click 🚀 Run Full Discovery Pipeline."
+        )
+    if failed and not analyzed:
+        return (
+            f"AI analysis failed for {failed} reviews. "
+            "Open Live Data for the error, then retry Run Full Discovery Pipeline."
+        )
+    return (
+        f"{stored} real reviews are stored ({pending} pending analysis). "
+        "Click 🚀 Run Full Discovery Pipeline to analyze them with OpenRouter."
+    )
 
 
 @st.cache_resource
@@ -100,6 +124,8 @@ def render() -> None:
     st.session_state["debug"] = st.sidebar.checkbox("Show debug traces", value=False)
 
     ai_ok = settings.has_ai_credentials
+    if "analyze_on_collect" not in st.session_state:
+        st.session_state["analyze_on_collect"] = bool(ai_ok)
     cutoff = _period_since()
     stored_all = get_review_count(myntra_only=myntra_only)
     st.sidebar.markdown("**Stored reviews**")
@@ -111,6 +137,11 @@ def render() -> None:
     st.sidebar.markdown("**AI**")
     st.sidebar.write("OpenRouter key:", "configured" if ai_ok else "missing")
     st.sidebar.write("Model:", settings.resolved_model)
+    diag = get_database_diagnostics()
+    st.sidebar.markdown("**Analysis**")
+    st.sidebar.write("Pending:", diag.get("pending_reviews", 0))
+    st.sidebar.write("Analyzed:", diag.get("analyzed_reviews", 0))
+    st.sidebar.write("Failed:", diag.get("failed_reviews", 0))
     path = sqlite_path()
     st.sidebar.caption("Storage: Local application storage")
     if path:
@@ -154,14 +185,17 @@ def _period_since():
 
 
 def _collect_buttons(ai_ok: bool) -> None:
-    c1, c2 = st.columns(2)
-    thirty = c1.button("Collect Last 30 Days", type="primary")
-    refresh = c2.button("🔄 Refresh Latest Reviews", type="primary")
-    analyze = bool(st.session_state.get("analyze_on_collect", False))
+    c1, c2, c3 = st.columns(3)
+    thirty = c1.button("Collect Last 30 Days")
+    refresh = c2.button("🔄 Refresh Latest Reviews")
+    full = c3.button("🚀 Run Full Discovery Pipeline", type="primary")
+    analyze = bool(st.session_state.get("analyze_on_collect", ai_ok))
     if thirty:
         _run_collect(["google_play", "apple_app_store"], analyze=analyze, mode="last_30_days")
     if refresh:
         _run_collect(["google_play", "apple_app_store"], analyze=analyze, mode="latest")
+    if full:
+        _run_full_discovery(ai_ok)
 
 
 def _overview(myntra_only: bool, ai_ok: bool) -> None:
@@ -249,7 +283,16 @@ def _overview(myntra_only: bool, ai_ok: bool) -> None:
     elif current_themes:
         st.write("Existing dominant barrier:", current_themes[0])
     if data.get("analyzed_reviews", 0) == 0:
-        st.info(NO_ANALYSIS)
+        diag = get_database_diagnostics()
+        msg = _analysis_blocker(
+            stored=diag.get("myntra_reviews") or count,
+            analyzed=diag.get("analyzed_reviews") or 0,
+            pending=diag.get("pending_reviews") or 0,
+            failed=diag.get("failed_reviews") or 0,
+            ai_ok=ai_ok,
+        )
+        if msg:
+            st.warning(msg) if msg != EMPTY else st.info(msg)
 
     st.subheader("Top user problems")
     if data.get("top_problems"):
@@ -523,6 +566,16 @@ def _live_data(ai_ok: bool) -> None:
 
     _show_last_collection()
     _diagnostics()
+    _pipeline_status_panel()
+    diag = get_database_diagnostics()
+    st.subheader("DATABASE DIAGNOSTICS")
+    st.write("Total reviews:", diag.get("total_reviews"))
+    st.write("Google Play reviews:", diag.get("google_play_reviews"))
+    st.write("Apple reviews:", diag.get("apple_reviews"))
+    st.write("Last 30-day reviews:", diag.get("last_30_day_reviews"))
+    st.write("Pending reviews:", diag.get("pending_reviews"))
+    st.write("Analyzed reviews:", diag.get("analyzed_reviews"))
+    st.write("Failed reviews:", diag.get("failed_reviews"))
     _collect_buttons(ai_ok)
 
     analyze = st.checkbox("Analyze new reviews after each poll", value=ai_ok)
@@ -577,9 +630,128 @@ def _live_data(ai_ok: bool) -> None:
         if not ai_ok:
             st.error("OPENROUTER_API_KEY is not set in Streamlit Secrets or .env.")
         elif get_review_count() == 0:
-            st.info(NO_ANALYSIS)
+            st.info(EMPTY)
         else:
             _run_analyze()
+
+
+def _run_full_discovery(ai_ok: bool) -> None:
+    from app.collectors.engine import CollectionEngine
+    from app.pipeline.orchestrator import run_analysis_pipeline
+
+    reload_settings()
+    settings = get_settings()
+    steps = st.session_state.setdefault(
+        "pipeline_steps",
+        {
+            "play": "pending",
+            "apple": "pending",
+            "save": "pending",
+            "analyze": "pending",
+            "insights": "pending",
+            "dashboard": "pending",
+        },
+    )
+    db = _db()
+    try:
+        with st.status("Full discovery pipeline", expanded=True) as box:
+            box.write("STEP 1 — Collecting Google Play")
+            steps["play"] = "running"
+            engine = CollectionEngine(db)
+            gp = engine.run(["google_play"], analyze=False, mode="last_30_days")
+            if gp.errors and gp.fetched == 0:
+                steps["play"] = "failed"
+                box.update(label="FAILED", state="error")
+                st.error("Google Play collection failed: " + "; ".join(gp.errors))
+                st.session_state["pipeline_steps"] = steps
+                return
+            steps["play"] = "done"
+            box.write(f"STEP 1 — Collecting Google Play ✓  fetched {gp.fetched}, new {gp.new}")
+
+            box.write("STEP 2 — Collecting Apple App Store")
+            steps["apple"] = "running"
+            apple = engine.run(["apple_app_store"], analyze=False, mode="last_30_days")
+            if apple.errors and apple.fetched == 0:
+                steps["apple"] = "failed"
+                box.update(label="FAILED", state="error")
+                st.error("Apple App Store collection failed: " + "; ".join(apple.errors))
+                st.session_state["pipeline_steps"] = steps
+                return
+            steps["apple"] = "done"
+            region = (apple.by_source.get("apple_app_store") or {}).get("region_used") or "—"
+            box.write(
+                f"STEP 2 — Collecting Apple App Store ✓  region={region} "
+                f"fetched {apple.fetched}, new {apple.new}"
+            )
+
+            box.write("STEP 3 — Saving reviews ✓")
+            steps["save"] = "done"
+
+            box.write("STEP 4 — Analyzing reviews")
+            steps["analyze"] = "running"
+            if not ai_ok or not settings.has_ai_credentials:
+                steps["analyze"] = "failed"
+                box.update(label="FAILED", state="error")
+                st.error(
+                    "AI analysis failed: OPENROUTER_API_KEY is not set in Streamlit Secrets or .env."
+                )
+                st.session_state["pipeline_steps"] = steps
+                st.session_state["last_analysis"] = {
+                    "status": "Failed",
+                    "message": "AI analysis failed: OPENROUTER_API_KEY is not set.",
+                }
+                return
+            try:
+                analyzed = run_analysis_pipeline(
+                    db, analyze_limit=settings.ai_analysis_batch_size
+                )
+            except Exception as exc:
+                steps["analyze"] = "failed"
+                box.update(label="FAILED", state="error")
+                st.error(f"AI analysis failed: {exc}")
+                st.session_state["pipeline_steps"] = steps
+                st.session_state["last_analysis"] = {"status": "Failed", "message": str(exc)}
+                return
+            steps["analyze"] = "done"
+            box.write(f"STEP 4 — Analyzing reviews ✓  analyzed {analyzed}")
+            box.write("STEP 5 — Generating discovery insights ✓")
+            steps["insights"] = "done"
+            box.write("STEP 6 — Updating dashboard ✓")
+            steps["dashboard"] = "done"
+            box.update(label="Discovery pipeline complete", state="complete")
+            st.session_state["last_analysis"] = {
+                "status": "Connected" if analyzed else "Configured",
+                "message": f"Analyzed {analyzed} reviews. Themes, segments, and opportunity scores were rebuilt.",
+            }
+            st.session_state["pipeline_steps"] = steps
+    except Exception as exc:
+        LOGGER.exception("Full discovery failed")
+        st.error(f"Discovery pipeline failed: {exc}")
+        if st.session_state.get("debug"):
+            st.code(traceback.format_exc())
+        return
+    finally:
+        db.close()
+    st.rerun()
+
+
+def _pipeline_status_panel() -> None:
+    steps = st.session_state.get("pipeline_steps") or {}
+    if not steps:
+        return
+    st.subheader("PIPELINE STATUS")
+    labels = [
+        ("play", "STEP 1  Collecting Google Play"),
+        ("apple", "STEP 2  Collecting Apple App Store"),
+        ("save", "STEP 3  Saving reviews"),
+        ("analyze", "STEP 4  Analyzing reviews"),
+        ("insights", "STEP 5  Generating discovery insights"),
+        ("dashboard", "STEP 6  Updating dashboard"),
+    ]
+    for key, title in labels:
+        state = steps.get(key, "pending")
+        mark = "✓" if state == "done" else ("FAILED" if state == "failed" else ("…" if state == "running" else "—"))
+        st.write(f"{title}  {mark}")
 
 
 def _run_collect(sources: list[str], analyze: bool, mode: str = "latest") -> None:
@@ -609,10 +781,16 @@ def _run_collect(sources: list[str], analyze: bool, mode: str = "latest") -> Non
             "stats": payload,
         }
         if analyze:
-            st.session_state["last_analysis"] = {
-                "status": "Connected" if stats.analyzed else "Skipped",
-                "message": f"Analyzed {stats.analyzed} new/pending reviews.",
-            }
+            if stats.analysis_error:
+                st.session_state["last_analysis"] = {"status": "Failed", "message": stats.analysis_error}
+            else:
+                st.session_state["last_analysis"] = {
+                    "status": "Connected" if stats.analyzed else "Skipped",
+                    "message": (
+                        f"Analyzed {stats.analyzed} reviews. "
+                        f"{stats.pending_remaining} still pending."
+                    ),
+                }
     except Exception as exc:
         LOGGER.exception("Collection failed")
         st.session_state["last_collection"] = {
@@ -727,10 +905,10 @@ def _run_analyze() -> None:
     db = _db()
     try:
         with st.spinner("Analyzing stored Myntra-valid reviews…"):
-            analyzed = run_analysis_pipeline(db)
+            analyzed = run_analysis_pipeline(db, analyze_limit=get_settings().ai_analysis_batch_size)
         if get_review_count(db) == 0:
-            st.session_state["last_analysis"] = {"status": "Failed", "message": NO_ANALYSIS}
-            st.info(NO_ANALYSIS)
+            st.session_state["last_analysis"] = {"status": "Failed", "message": EMPTY}
+            st.info(EMPTY)
             return
         if analyzed == 0:
             st.session_state["last_analysis"] = {
@@ -795,72 +973,173 @@ def _labels(field: str, myntra_only: bool, title: str) -> None:
     since = _period_since()
     db = _db()
     try:
-        count = get_review_count(db, since=since)
-        all_time = get_review_count(db)
-        rows = label_distribution(db, field, myntra_only=myntra_only, since=since)
+        count = get_review_count(db, since=since, myntra_only=myntra_only)
+        all_time = get_review_count(db, myntra_only=myntra_only)
+        rows = label_distribution(
+            db, field, myntra_only=myntra_only, relevant_only=False, since=since
+        )
+        diag = get_database_diagnostics(db)
+        analyzed = diag.get("analyzed_reviews") or 0
     finally:
         db.close()
+    ai_ok = get_settings().has_ai_credentials
     if all_time == 0:
         st.info(EMPTY)
+        _collect_buttons(ai_ok)
         return
     if count == 0:
         st.info("No reviews with timestamps in the selected period.")
         return
     if not rows:
-        st.info(NO_ANALYSIS)
+        msg = _analysis_blocker(
+            stored=all_time,
+            analyzed=analyzed,
+            pending=diag.get("pending_reviews") or 0,
+            failed=diag.get("failed_reviews") or 0,
+            ai_ok=ai_ok,
+        )
+        if msg:
+            (st.info if msg == EMPTY else st.warning)(msg)
+            _collect_buttons(ai_ok)
+            return
+        st.info(
+            f"{analyzed} reviews were analyzed; none contained this signal in the selected period. "
+            "That is a sample-size statement about analyzed reviews, not about all Myntra users."
+        )
         return
-    st.dataframe(rows, width="stretch")
+    st.caption(
+        f"Sample size: {rows[0].get('denominator', analyzed)} analyzed reviews in this period. "
+        "Percentages are of analyzed reviews, not of the Myntra user base."
+    )
+    st.dataframe(
+        [
+            {
+                "signal": r["label"],
+                "frequency": r["count"],
+                "percentage": r["percentage"],
+                "supporting_reviews": r["count"],
+                "sources": ", ".join(r.get("sources") or []),
+                "review_ids": r.get("review_ids") or [],
+            }
+            for r in rows
+        ],
+        width="stretch",
+    )
+    if rows and rows[0].get("review_ids"):
+        st.subheader("Supporting evidence")
+        db = _db()
+        try:
+            cards = evidence_cards(db, rows[0]["review_ids"], limit=8)
+        finally:
+            db.close()
+        for card in cards:
+            st.write(f"“{card['quote']}”")
+            st.caption(
+                f"{card['source']} · rating {card.get('rating')} · region {card.get('region') or '—'} · "
+                f"review date {card['date']} · id {card['source_review_id']}"
+            )
 
 
 def _root_causes(myntra_only: bool = True) -> None:
     st.title("User Problems")
     since = _period_since()
+    ai_ok = get_settings().has_ai_credentials
     db = _db()
     try:
-        all_time = get_review_count(db)
-        count = get_review_count(db, since=since)
-        query = db.query(Analysis).join(Review).filter(Analysis.is_valid_json.is_(True))
-        if myntra_only:
-            query = query.filter(Review.is_valid_source.is_(True))
-        if since is not None:
-            query = query.filter(Review.review_date.isnot(None), Review.review_date >= since)
-        rows = query.all()
-        items = [r for r in rows if (r.root_cause or "").strip()]
+        all_time = get_review_count(db, myntra_only=myntra_only)
+        count = get_review_count(db, since=since, myntra_only=myntra_only)
+        rows = problem_rows(db, myntra_only=myntra_only, since=since)
+        diag = get_database_diagnostics(db)
+        cards_by_problem = {}
+        if rows:
+            cards_by_problem = {
+                rows[0]["problem"]: evidence_cards(db, rows[0].get("review_ids") or [], limit=8)
+            }
     finally:
         db.close()
     if all_time == 0:
         st.info(EMPTY)
+        _collect_buttons(ai_ok)
         return
     if count == 0:
         st.info("No reviews with timestamps in the selected period.")
         return
-    if not items:
-        st.info(NO_ANALYSIS)
-        return
-    for row in items[:80]:
-        st.write(row.root_cause)
-        st.caption(
-            f"observed: {row.root_cause_observed or '—'} · "
-            f"inferred: {row.root_cause_inferred or '—'} · "
-            f"hypothesized: {row.root_cause_hypothesized or '—'} · "
-            f"analyzed_at: {row.analyzed_at} · model: {row.model} · status: {getattr(row, 'status', '')}"
+    if not rows:
+        msg = _analysis_blocker(
+            stored=all_time,
+            analyzed=diag.get("analyzed_reviews") or 0,
+            pending=diag.get("pending_reviews") or 0,
+            failed=diag.get("failed_reviews") or 0,
+            ai_ok=ai_ok,
         )
+        if msg:
+            (st.info if msg == EMPTY else st.warning)(msg)
+            _collect_buttons(ai_ok)
+            return
+        st.info(
+            f"{diag.get('analyzed_reviews', 0)} reviews were analyzed; "
+            "no root-cause statements were extracted in this period."
+        )
+        return
+    st.caption(
+        f"Sample size: {rows[0].get('denominator')} analyzed reviews. "
+        "Severity and purchase impact are programmatic 1–5 scores, not LLM arithmetic."
+    )
+    st.dataframe(
+        [
+            {
+                "problem": r["problem"],
+                "frequency": r["frequency"],
+                "% of analyzed": r["percentage"],
+                "severity": f"{r['severity']}/5",
+                "purchase_impact": f"{r['purchase_impact']}/5",
+                "supporting_reviews": r["supporting_reviews"],
+                "confidence": r["confidence"],
+                "model": r["model"],
+                "analysis_version": r["analysis_version"],
+            }
+            for r in rows
+        ],
+        width="stretch",
+    )
+    if cards_by_problem:
+        st.subheader("Supporting evidence (top problem)")
+        for card in next(iter(cards_by_problem.values())):
+            st.write(f"“{card['quote']}”")
+            st.caption(
+                f"{card['source']} · rating {card.get('rating')} · region {card.get('region') or '—'} · "
+                f"review date {card['date']} · id {card['source_review_id']}"
+            )
 
 
 def _opportunities() -> None:
     st.title("Opportunity Matrix")
     st.caption("Score = reach × frequency × purchase impact × severity × evidence confidence (each 1–5). Calculated in Python.")
+    ai_ok = get_settings().has_ai_credentials
     db = _db()
     try:
-        count = get_review_count(db)
+        count = get_review_count(db, myntra_only=True)
         rows = db.query(Opportunity).order_by(Opportunity.rank.asc()).all()
+        diag = get_database_diagnostics(db)
     finally:
         db.close()
     if count == 0:
         st.info(EMPTY)
+        _collect_buttons(ai_ok)
         return
     if not rows:
-        st.info(NO_ANALYSIS)
+        msg = _analysis_blocker(
+            stored=count,
+            analyzed=diag.get("analyzed_reviews") or 0,
+            pending=diag.get("pending_reviews") or 0,
+            failed=diag.get("failed_reviews") or 0,
+            ai_ok=ai_ok,
+        )
+        if msg:
+            (st.info if msg == EMPTY else st.warning)(msg)
+            _collect_buttons(ai_ok)
+            return
+        st.info("Reviews were analyzed, but no opportunity groups could be scored from extracted barriers yet.")
         return
     st.dataframe(
         [
@@ -889,8 +1168,8 @@ def _named(model, title: str) -> None:
     since = _period_since()
     db = _db()
     try:
-        count = get_review_count(db, since=since)
-        all_time = get_review_count(db)
+        count = get_review_count(db, since=since, myntra_only=True)
+        all_time = get_review_count(db, myntra_only=True)
         rows = db.query(model).all()
         momentum = []
         if model is Theme and since is not None:
@@ -899,12 +1178,28 @@ def _named(model, title: str) -> None:
         db.close()
     if all_time == 0:
         st.info(EMPTY)
+        _collect_buttons(get_settings().has_ai_credentials)
         return
     if count == 0:
         st.info("No reviews with timestamps in the selected period.")
         return
     if not rows:
-        st.info(NO_ANALYSIS)
+        diag = get_database_diagnostics()
+        msg = _analysis_blocker(
+            stored=all_time,
+            analyzed=diag.get("analyzed_reviews") or 0,
+            pending=diag.get("pending_reviews") or 0,
+            failed=diag.get("failed_reviews") or 0,
+            ai_ok=get_settings().has_ai_credentials,
+        )
+        if msg:
+            (st.info if msg == EMPTY else st.warning)(msg)
+            _collect_buttons(get_settings().has_ai_credentials)
+            return
+        st.info(
+            f"{diag.get('analyzed_reviews', 0)} reviews were analyzed; "
+            "no evidence-backed items of this type were generated."
+        )
         return
     if momentum:
         st.subheader("Emerging / stable / declining (selected period)")
@@ -936,9 +1231,22 @@ def _evidence() -> None:
         rows = db.query(Opportunity).order_by(Opportunity.rank.asc()).all()
         if count == 0:
             st.info(EMPTY)
+            _collect_buttons(get_settings().has_ai_credentials)
             return
         if not rows:
-            st.info(NO_ANALYSIS)
+            diag = get_database_diagnostics(db)
+            msg = _analysis_blocker(
+                stored=count,
+                analyzed=diag.get("analyzed_reviews") or 0,
+                pending=diag.get("pending_reviews") or 0,
+                failed=diag.get("failed_reviews") or 0,
+                ai_ok=get_settings().has_ai_credentials,
+            )
+            if msg:
+                (st.info if msg == EMPTY else st.warning)(msg)
+                _collect_buttons(get_settings().has_ai_credentials)
+                return
+            st.info("No opportunity evidence groups are linked yet.")
             return
         choice = st.selectbox("Opportunity", [f"{o.rank}. {o.user_problem}" for o in rows])
         rank = int(str(choice).split(".", 1)[0])
@@ -971,26 +1279,67 @@ def _report() -> None:
         db.close()
     if count == 0:
         st.info(EMPTY)
-        return
-    if report["sections"]["4_data_volume"]["total_reviews"] == 0:
-        st.info(EMPTY)
+        _collect_buttons(get_settings().has_ai_credentials)
         return
     st.write(report["research_question"])
     st.write(report["business_goal"])
     st.caption(report["anti_solution_note"])
+    diag = get_database_diagnostics()
+    st.subheader("Executive summary")
+    st.write(
+        f"Stored Myntra-valid reviews: {diag.get('myntra_reviews')}. "
+        f"Analyzed: {diag.get('analyzed_reviews')}. Pending: {diag.get('pending_reviews')}."
+    )
+    if (diag.get("analyzed_reviews") or 0) == 0:
+        msg = _analysis_blocker(
+            stored=diag.get("myntra_reviews") or count,
+            analyzed=0,
+            pending=diag.get("pending_reviews") or 0,
+            failed=diag.get("failed_reviews") or 0,
+            ai_ok=get_settings().has_ai_credentials,
+        )
+        if msg:
+            (st.info if msg == EMPTY else st.warning)(msg)
+            _collect_buttons(get_settings().has_ai_credentials)
+            return
+    st.subheader("Key user problems")
+    for item in (report["sections"].get("7_purchase_barriers") or [])[:8]:
+        st.write(f"- {item.get('label')} ({item.get('count')} reviews, {item.get('percentage')}%)")
+    st.subheader("Why users wishlist")
+    for item in (report["sections"].get("6_wishlist_motivations") or [])[:8]:
+        st.write(f"- {item.get('label')} ({item.get('count')})")
+    st.subheader("Why users do not purchase")
+    for item in (report["sections"].get("7_purchase_barriers") or [])[:8]:
+        st.write(f"- {item.get('label')} ({item.get('count')})")
+    st.subheader("Purchase uncertainties")
+    for item in (report["sections"].get("8_uncertainties") or [])[:8]:
+        st.write(f"- {item.get('label')} ({item.get('count')})")
+    st.subheader("Top themes")
+    for theme in report["sections"].get("13_emergent_themes") or []:
+        st.write(f"- {theme.get('name')} ({theme.get('review_count')} reviews)")
+    st.subheader("User segments")
+    for seg in report["sections"].get("11_user_segments") or []:
+        st.write(f"- {seg.get('name')} ({seg.get('review_count')} reviews)")
     st.subheader("What we know")
     for item in report["sections"]["19_what_we_know"]:
         st.write("-", item)
     st.subheader("What we don’t know")
     for item in report["sections"]["20_what_we_dont_know"]:
         st.write("-", item)
+    st.subheader("Data limitations")
+    st.write(
+        "Public app-store reviews are not a conversion dataset. "
+        "They over-represent extreme ratings and cannot prove 30-day wishlist conversion. "
+        "Storage: Local application storage (ephemeral on Streamlit Cloud)."
+    )
     primary = report.get("single_most_promising_problem") or {}
-    st.subheader("Single most promising user problem")
-    st.write(primary.get("why_first") or NO_ANALYSIS)
+    st.subheader("Opportunity areas")
+    st.write(primary.get("why_first") or "No scored opportunity yet — analyze pending reviews first.")
     top = report.get("top_opportunities") or []
     if not top:
-        st.info(NO_ANALYSIS)
+        st.caption("Opportunity scores appear after barriers are extracted from analyzed reviews.")
         return
+    st.subheader("Evidence")
     for item in top:
         st.markdown(f"**#{item['rank']} {item['opportunity']}** — score {item['opportunity_score']}")
         for ev in item.get("evidence") or []:
