@@ -1,4 +1,4 @@
-"""Google Gemini AI gateway. Keys and model names come only from Settings."""
+"""OpenRouter AI gateway. Keys and model names come only from Settings."""
 
 from __future__ import annotations
 
@@ -7,13 +7,19 @@ import re
 import time
 from typing import Any
 
+import httpx
+
 from app.config import Settings, get_settings
-from config.settings import normalize_gemini_model
+from config.settings import normalize_openrouter_model
 
 logger = logging.getLogger(__name__)
 
-QUOTA_MESSAGE = "Gemini API quota/rate limit reached. Please try again later."
-MISSING_KEY_MESSAGE = "Gemini API key is not configured."
+QUOTA_MESSAGE = "OpenRouter API quota/rate limit reached. Please try again later."
+MISSING_KEY_MESSAGE = (
+    "OpenRouter API key is not configured. "
+    "Add OPENROUTER_API_KEY to Streamlit Secrets or .env."
+)
+DEFAULT_TIMEOUT = httpx.Timeout(60.0, connect=15.0)
 
 
 def _redact(text: str) -> str:
@@ -33,50 +39,21 @@ def _backoff_seconds(attempt: int, retry_after: float | None = None) -> float:
     return min(8.0, max(0.5, wait))
 
 
-def _error_status(exc: BaseException) -> int | None:
-    for attr in ("code", "status_code", "http_status"):
-        value = getattr(exc, attr, None)
-        if isinstance(value, int):
-            return value
-        if isinstance(value, str) and value.isdigit():
-            return int(value)
-    status = getattr(exc, "status", None)
-    if isinstance(status, int):
-        return status
-    return None
+def _retry_after_seconds(response: httpx.Response | None) -> float | None:
+    if response is None:
+        return None
+    raw = response.headers.get("retry-after") or response.headers.get("Retry-After")
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
 
 
-def _is_quota_error(message: str, status: int | None) -> bool:
-    if status == 429:
-        return True
-    lowered = (message or "").lower()
-    return any(
-        token in lowered
-        for token in (
-            "resource_exhausted",
-            "resource exhausted",
-            "quota",
-            "rate limit",
-            "too many requests",
-        )
-    )
-
-
-def _is_closed_client_error(message: str) -> bool:
-    lowered = (message or "").lower()
-    return "client has been closed" in lowered or "client is closed" in lowered
-
-
-def _client_is_unusable(client: Any) -> bool:
-    if client is None:
-        return True
-    if getattr(client, "_closed", False) is True:
-        return True
-    api = getattr(client, "_api_client", None)
-    httpx_client = getattr(api, "_httpx_client", None) if api is not None else None
-    if httpx_client is not None and getattr(httpx_client, "is_closed", False):
-        return True
-    return False
+def _supports_json_object(model: str) -> bool:
+    lowered = (model or "").lower()
+    return "gemini" not in lowered
 
 
 class AIError(RuntimeError):
@@ -92,143 +69,216 @@ class AIError(RuntimeError):
         self.http_status = http_status
 
 
-class GeminiAIService:
-    """Production AI path: official Google Gemini API only.
-
-    The google-genai Client must be retained for the whole analysis run.
-    Chaining ``Client().models.generate_content(...)`` lets the Client be
-    garbage-collected, which closes the HTTP session and raises
-    "Cannot send a request, as the client has been closed."
-    """
+class OpenRouterAIService:
+    """Production AI path: OpenRouter chat completions only."""
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
-        self._client_instance: Any = None
 
     @property
     def provider_name(self) -> str:
-        return "gemini"
+        return "openrouter"
 
     @property
     def model(self) -> str:
-        return normalize_gemini_model(self.settings.resolved_model)
+        return normalize_openrouter_model(self.settings.resolved_model)
+
+    @property
+    def _endpoint(self) -> str:
+        base = (self.settings.openrouter_base_url or "https://openrouter.ai/api/v1").rstrip("/")
+        return f"{base}/chat/completions"
 
     def available(self) -> bool:
-        return bool((self.settings.gemini_api_key or "").strip())
-
-    def _client(self):
-        """Create a new Gemini Client. Callers must retain the return value."""
-        from google import genai
-
-        return genai.Client(api_key=self.settings.gemini_api_key)
-
-    def _get_client(self):
-        if _client_is_unusable(self._client_instance):
-            self._client_instance = self._client()
-        return self._client_instance
-
-    def _discard_client(self) -> None:
-        """Drop a closed/broken client without retrying it."""
-        client = self._client_instance
-        self._client_instance = None
-        closer = getattr(client, "close", None)
-        if callable(closer):
-            try:
-                closer()
-            except Exception:
-                logger.debug("Discarding Gemini client failed", exc_info=True)
+        return bool((self.settings.openrouter_api_key or "").strip())
 
     def close(self) -> None:
-        """Close the HTTP client after the analysis run finishes."""
-        self._discard_client()
+        """No persistent HTTP client; present for pipeline finally-blocks."""
+        return None
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.settings.openrouter_api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/kumarsak621-max/Myntra-AI-discovery-wishlist",
+            "X-Title": "Myntra AI Discovery Engine",
+        }
+
+    def _timeout(self) -> httpx.Timeout:
+        seconds = float(getattr(self.settings, "ai_http_timeout_seconds", 60) or 60)
+        return httpx.Timeout(seconds, connect=min(15.0, seconds))
 
     def complete_json(self, *, system: str, user: str) -> str:
         if not self.available():
             raise AIError(MISSING_KEY_MESSAGE)
-        from google.genai import types
-
         last_error: AIError | None = None
         attempts = max(1, int(self.settings.ai_retry_attempts or 5))
+        use_json_object = _supports_json_object(self.model)
         for attempt in range(1, attempts + 1):
             try:
-                client = self._get_client()
-                response = client.models.generate_content(
-                    model=self.model,
-                    contents=user,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system,
-                        temperature=0.2,
-                        response_mime_type="application/json",
-                    ),
+                text = self._post_chat(
+                    system=system,
+                    user=user,
+                    json_object=use_json_object,
                 )
-                text = (getattr(response, "text", None) or "").strip()
                 if not text:
-                    raise AIError("Gemini returned empty content.")
+                    raise AIError("OpenRouter returned empty content.")
                 return text
             except AIError as exc:
+                if (
+                    exc.http_status == 400
+                    and use_json_object
+                    and "json" in str(exc).lower()
+                ):
+                    use_json_object = False
+                    last_error = exc
+                    time.sleep(_backoff_seconds(attempt))
+                    continue
                 if not exc.retryable:
                     raise
                 last_error = exc
                 time.sleep(_backoff_seconds(attempt))
             except Exception as exc:
-                if _is_closed_client_error(str(exc)):
-                    logger.warning("Gemini client was closed; creating a new client and retrying")
-                    self._discard_client()
-                    mapped = AIError(
-                        "Cannot send a request, as the client has been closed.",
-                        retryable=True,
-                    )
-                else:
-                    mapped = _map_gemini_exception(exc)
+                mapped = _map_openrouter_exception(exc)
                 if not mapped.retryable:
                     raise mapped
                 last_error = mapped
-                logger.warning("Gemini call failed attempt %s: %s", attempt, mapped)
+                logger.warning("OpenRouter call failed attempt %s: %s", attempt, mapped)
                 time.sleep(_backoff_seconds(attempt))
-        raise last_error or AIError("Gemini request failed")
+        raise last_error or AIError("OpenRouter request failed")
+
+    def _post_chat(self, *, system: str, user: str, json_object: bool) -> str:
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "temperature": 0.2,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        }
+        if json_object:
+            payload["response_format"] = {"type": "json_object"}
+        try:
+            with httpx.Client(timeout=self._timeout()) as client:
+                response = client.post(self._endpoint, headers=self._headers(), json=payload)
+        except httpx.TimeoutException as exc:
+            raise AIError("The OpenRouter request timed out. Try fewer reviews, then retry.", retryable=True) from exc
+        except httpx.ConnectError as exc:
+            raise AIError("Network error contacting OpenRouter.", retryable=True) from exc
+        return _content_from_response(response)
 
 
-AIProvider = GeminiAIService
+AIProvider = OpenRouterAIService
 
 
-def _map_gemini_exception(exc: BaseException) -> AIError:
-    status = _error_status(exc)
-    message = _redact(str(exc) or exc.__class__.__name__)
-    if _is_quota_error(message, status):
-        return AIError(QUOTA_MESSAGE, retryable=True, http_status=status or 429)
-    lowered = message.lower()
-    if status in {401, 403} or "api key" in lowered or "unauthenticated" in lowered or "permission" in lowered:
-        return AIError(
-            "Gemini rejected the API key. Check GEMINI_API_KEY in Streamlit Secrets or .env.",
-            http_status=status or 403,
+def _message_content(message: Any) -> str:
+    """Read OpenRouter chat content from string or multimodal list parts."""
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                parts.append(str(item.get("text") or item.get("content") or ""))
+        joined = "".join(parts).strip()
+        if joined:
+            return joined
+    return ""
+
+
+def _openrouter_error_text(response: httpx.Response) -> str:
+    body = _redact(response.text or "")
+    try:
+        payload = response.json()
+    except ValueError:
+        return body[:300]
+    if not isinstance(payload, dict):
+        return body[:300]
+    err = payload.get("error")
+    if isinstance(err, dict):
+        return _redact(str(err.get("message") or err.get("code") or err))[:300]
+    if isinstance(err, str):
+        return _redact(err)[:300]
+    return body[:300]
+
+
+def _content_from_response(response: httpx.Response) -> str:
+    status = response.status_code
+    snippet = _openrouter_error_text(response)
+    if status == 401 or status == 403:
+        raise AIError(
+            f"OpenRouter analysis failed: API key/configuration issue (HTTP {status}). "
+            "Check OPENROUTER_API_KEY in Streamlit Secrets or .env.",
+            http_status=status,
         )
-    if status in {500, 502, 503, 504} or "unavailable" in lowered or "internal" in lowered:
-        return AIError(
-            f"Gemini provider error HTTP {status or '5xx'}. Retrying.",
+    if status == 404:
+        raise AIError(
+            f"OpenRouter analysis failed: model unavailable (HTTP 404). "
+            f"{snippet or 'Set OPENROUTER_MODEL to a model your OpenRouter account can use.'}",
+            http_status=404,
+        )
+    if status == 429:
+        raise AIError(QUOTA_MESSAGE, retryable=True, http_status=429)
+    if status in {500, 502, 503, 504}:
+        raise AIError(
+            f"OpenRouter analysis failed: provider/server error HTTP {status}. Retrying.",
             retryable=True,
             http_status=status,
         )
-    if "timeout" in lowered or "timed out" in lowered or "deadline" in lowered:
-        return AIError("The Gemini request timed out. Try fewer reviews, then retry.", retryable=True)
-    if "connect" in lowered or "network" in lowered:
-        return AIError("Network error contacting Gemini.", retryable=True)
-    if _is_closed_client_error(message):
-        return AIError(
-            message[:400] or "Cannot send a request, as the client has been closed.",
-            retryable=True,
+    if status == 400:
+        raise AIError(
+            f"OpenRouter analysis failed: invalid request (HTTP 400). {snippet or 'request failed'}",
+            http_status=400,
         )
-    return AIError(message[:400], http_status=status)
+    if status >= 400:
+        retryable = status >= 500
+        raise AIError(
+            f"OpenRouter analysis failed: HTTP {status}. {snippet or 'request failed'}",
+            retryable=retryable,
+            http_status=status,
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise AIError("OpenRouter returned invalid JSON.") from exc
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    if not choices:
+        raise AIError("OpenRouter returned no choices.")
+    message = (choices[0] or {}).get("message") or {}
+    refusal = message.get("refusal") if isinstance(message, dict) else None
+    if refusal:
+        raise AIError(f"OpenRouter analysis failed: model refused the request. {_redact(str(refusal))[:200]}")
+    text = _message_content(message)
+    if not text:
+        raise AIError("OpenRouter returned empty content.")
+    return text
 
 
-def test_gemini_connection(settings: Settings | None = None) -> dict[str, Any]:
-    """Minimal live Gemini request. Never logs or returns the API key."""
+def _map_openrouter_exception(exc: BaseException) -> AIError:
+    if isinstance(exc, AIError):
+        return exc
+    message = _redact(str(exc) or exc.__class__.__name__)
+    lowered = message.lower()
+    if "timeout" in lowered or "timed out" in lowered:
+        return AIError("The OpenRouter request timed out. Try fewer reviews, then retry.", retryable=True)
+    if "connect" in lowered or "network" in lowered:
+        return AIError("Network error contacting OpenRouter.", retryable=True)
+    return AIError(message[:400])
+
+
+def test_openrouter_connection(settings: Settings | None = None) -> dict[str, Any]:
+    """Minimal live OpenRouter request. Never logs or returns the API key."""
     from config.settings import reload_settings
 
     settings = settings or reload_settings()
-    model = normalize_gemini_model(settings.gemini_model or settings.resolved_model)
-    configured = bool((settings.gemini_api_key or "").strip())
+    model = normalize_openrouter_model(settings.openrouter_model or settings.resolved_model)
+    configured = bool((settings.openrouter_api_key or "").strip())
     result: dict[str, Any] = {
-        "provider": "Google Gemini",
+        "provider": "OpenRouter",
         "model": model,
         "credentials": "Configured" if configured else "Missing",
         "ok": False,
@@ -240,43 +290,37 @@ def test_gemini_connection(settings: Settings | None = None) -> dict[str, Any]:
         result["error"] = MISSING_KEY_MESSAGE
         return result
 
-    from google.genai import types
-
+    service = OpenRouterAIService(settings)
     attempts = min(3, max(1, int(settings.ai_retry_attempts or 3)))
-    last_error = "Gemini connection test failed."
+    last_error = "OpenRouter connection test failed."
     for attempt in range(1, attempts + 1):
         try:
-            from google import genai
-
-            client = genai.Client(api_key=settings.gemini_api_key)
-            try:
-                response = client.models.generate_content(
-                    model=model,
-                    contents="Reply with the single word ok.",
-                    config=types.GenerateContentConfig(temperature=0, max_output_tokens=16),
-                )
-                text = (getattr(response, "text", None) or "").strip()
-                if not text:
-                    result["error"] = "Gemini returned empty content."
-                    return result
-                result["ok"] = True
-                result["status"] = "SUCCESS"
-                result["http_status"] = 200
-                result["error"] = None
+            payload = {
+                "model": model,
+                "temperature": 0,
+                "max_tokens": 16,
+                "messages": [
+                    {"role": "system", "content": "You are a test assistant."},
+                    {"role": "user", "content": "Reply with the word OK."},
+                ],
+            }
+            with httpx.Client(timeout=service._timeout()) as client:
+                response = client.post(service._endpoint, headers=service._headers(), json=payload)
+            result["http_status"] = response.status_code
+            text = _content_from_response(response)
+            if not text:
+                result["error"] = "OpenRouter returned empty content."
                 return result
-            finally:
-                closer = getattr(client, "close", None)
-                if callable(closer):
-                    try:
-                        closer()
-                    except Exception:
-                        logger.debug("Gemini connection-test client close failed", exc_info=True)
+            result["ok"] = True
+            result["status"] = "SUCCESS"
+            result["error"] = None
+            return result
         except Exception as exc:
-            mapped = _map_gemini_exception(exc)
+            mapped = _map_openrouter_exception(exc)
             last_error = str(mapped)
             result["http_status"] = mapped.http_status
             if mapped.retryable and attempt < attempts:
-                time.sleep(_backoff_seconds(attempt))
+                time.sleep(_backoff_seconds(attempt, None))
                 continue
             result["error"] = last_error
             return result

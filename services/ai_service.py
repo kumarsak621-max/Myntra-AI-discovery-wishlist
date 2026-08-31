@@ -1,8 +1,8 @@
 from app.ai.provider import (
     AIError,
     AIProvider,
-    GeminiAIService,
-    test_gemini_connection,
+    OpenRouterAIService,
+    test_openrouter_connection,
 )
 
-__all__ = ["AIError", "AIProvider", "GeminiAIService", "test_gemini_connection"]
+__all__ = ["AIError", "AIProvider", "OpenRouterAIService", "test_openrouter_connection"]

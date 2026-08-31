@@ -183,12 +183,13 @@ class CollectionEngine:
                 if progress:
                     progress({"stage": "analysis", "status": "start"})
                 from app.ai.provider import AIError
+                from app.pipeline.analysis import smoke_test_analyze_limit
                 from app.pipeline.orchestrator import run_analysis_pipeline
 
                 limit = (
                     analyze_limit
                     if analyze_limit is not None
-                    else self.settings.ai_analysis_batch_size
+                    else smoke_test_analyze_limit(self.db, self.settings)
                 )
                 try:
                     result = run_analysis_pipeline(self.db, progress=progress, analyze_limit=limit)
@@ -204,7 +205,7 @@ class CollectionEngine:
                     combined.errors.append(msg)
                     combined.analysis_error = msg
                 except Exception as exc:
-                    msg = f"AI analysis failed: {exc}"
+                    msg = f"OpenRouter analysis failed: {exc}"
                     logger.exception(msg)
                     combined.errors.append(msg)
                     combined.analysis_error = msg

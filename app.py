@@ -56,20 +56,26 @@ class DiscoveryEngineApp:
         self.settings = get_settings()
         self._validate_configuration()
         startup_line("Configuration loaded")
+        print("Provider: OpenRouter")
+        print(f"Model: {self.settings.resolved_model}")
+        print(
+            "API key configured: "
+            + ("YES" if self.settings.has_ai_credentials else "NO")
+        )
 
         from app.database import init_db
 
         init_db()
         startup_line("Database initialized")
 
-        from services.ai_service import GeminiAIService
+        from services.ai_service import OpenRouterAIService
 
-        self.ai = GeminiAIService(self.settings)
+        self.ai = OpenRouterAIService(self.settings)
         if self.ai.available():
-            startup_line(f"AI provider initialized (Google Gemini / {self.settings.resolved_model})")
+            startup_line(f"AI provider initialized (OpenRouter / {self.settings.resolved_model})")
         else:
             startup_line(
-                "AI provider initialized (Gemini API key is not configured. Collection still works; analysis is skipped.)",
+                "AI provider initialized (OpenRouter API key is not configured. Collection still works; analysis is skipped.)",
                 ok=True,
             )
 

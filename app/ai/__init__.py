@@ -3,15 +3,15 @@
 from app.ai.provider import (
     AIError,
     AIProvider,
-    GeminiAIService,
+    OpenRouterAIService,
     redact_secrets,
-    test_gemini_connection,
+    test_openrouter_connection,
 )
 
 __all__ = [
     "AIError",
     "AIProvider",
-    "GeminiAIService",
+    "OpenRouterAIService",
     "redact_secrets",
-    "test_gemini_connection",
+    "test_openrouter_connection",
 ]

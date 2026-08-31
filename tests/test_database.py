@@ -158,7 +158,7 @@ def test_database_diagnostics_counts_pending(db):
     assert diag["google_play_reviews"] == 1
     assert diag["pending_reviews"] >= 1
     assert diag["analyzed_reviews"] == 0
-    assert diag["ai_provider"] == "Google Gemini"
+    assert diag["ai_provider"] == "OpenRouter"
     assert diag["ai_model"]
     assert diag["last_successful_analysis_at"] is None
     assert diag["last_analysis_error"] is None
@@ -193,7 +193,7 @@ def test_ai_diagnostics_never_includes_key(db):
     )
     diag = get_ai_diagnostics(db)
     assert diag["api_key_configured"] in {"YES", "NO"}
-    assert diag["ai_provider"] == "Google Gemini"
+    assert diag["ai_provider"] == "OpenRouter"
     assert diag["ai_model"]
     assert "gemini_api_key" not in diag
     assert "openrouter_api_key" not in diag

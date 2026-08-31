@@ -16,8 +16,8 @@ from app.schemas import NormalizedReview
 def _settings(**kwargs) -> Settings:
     values = {
         "collection_rate_limit_seconds": 0,
-        "gemini_api_key": "unit-test-key",
-        "gemini_model": "gemini-2.5-flash",
+        "openrouter_api_key": "unit-test-key",
+        "openrouter_model": "google/gemini-2.5-flash",
         "ai_rate_limit_seconds": 0,
         "ai_request_batch_size": 2,
         "ai_retry_attempts": 2,
@@ -87,7 +87,7 @@ class FakeProvider:
 
     @property
     def provider_name(self) -> str:
-        return "gemini"
+        return "openrouter"
 
     @property
     def model(self) -> str:
@@ -195,3 +195,43 @@ def test_failed_reviews_are_retried(db):
     assert result.analyzed == 1
     assert row.analysis.status == "analyzed"
     assert db.query(Analysis).filter(Analysis.status == "analyzed").count() == 1
+
+
+def test_only_failed_skips_pending(db):
+    pending = _insert(db, "still-pending", "Wishlisted a kurta. Waiting for a sale.")
+    failed = _insert(db, "was-failed", "Saved shoes but size chart is missing.")
+    failed.analysis.status = "failed"
+    failed.analysis.is_valid_json = False
+    failed.analysis.parse_error = "previous timeout"
+    failed.analysis.content_hash = failed.content_hash
+    db.commit()
+
+    assert pending.id not in {r.id for r in reviews_needing_analysis(db, only_failed=True)}
+    assert failed.id in {r.id for r in reviews_needing_analysis(db, only_failed=True)}
+    assert failed.id not in {r.id for r in reviews_needing_analysis(db, include_failed=False)}
+    assert pending.id in {r.id for r in reviews_needing_analysis(db, include_failed=False)}
+
+
+def test_insights_are_blocked_when_analysis_fails(db, monkeypatch):
+    from app.pipeline.analysis import AnalysisRunResult
+    from app.pipeline.orchestrator import run_analysis_pipeline
+
+    called = {"themes": 0}
+
+    def boom(_session):
+        called["themes"] += 1
+        raise AssertionError("themes must not run when analysis failed")
+
+    monkeypatch.setattr("app.pipeline.orchestrator.discover_themes", boom)
+    monkeypatch.setattr(
+        "app.pipeline.orchestrator.analyze_new_reviews",
+        lambda *a, **k: AnalysisRunResult(
+            analyzed=0,
+            failed=5,
+            last_error="OpenRouter analysis failed: invalid request (HTTP 400).",
+        ),
+    )
+    result = run_analysis_pipeline(db, analyze_limit=5)
+    assert result.analyzed == 0
+    assert result.failed == 5
+    assert called["themes"] == 0

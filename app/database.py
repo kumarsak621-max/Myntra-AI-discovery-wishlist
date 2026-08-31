@@ -286,7 +286,7 @@ def get_database_diagnostics(db: Session | None = None) -> dict[str, Any]:
             "themes": session.query(Theme).count(),
             "segments": session.query(Segment).count(),
             "opportunities": session.query(Opportunity).count(),
-            "ai_provider": "Google Gemini",
+            "ai_provider": "OpenRouter",
             "ai_model": settings.resolved_model,
             "last_successful_analysis_at": last_ok.isoformat() if last_ok else None,
             "last_analysis_error": last_error or None,
@@ -337,7 +337,7 @@ def get_ai_diagnostics(db: Session | None = None) -> dict[str, Any]:
         if last_http_row and last_http_row[1] and not last_error:
             last_error = redact_secrets(str(last_http_row[1]))
         return {
-            "ai_provider": "Google Gemini",
+            "ai_provider": "OpenRouter",
             "ai_model": settings.resolved_model,
             "api_key_configured": "YES" if settings.has_ai_credentials else "NO",
             "pending_reviews": base.get("pending_reviews") or 0,

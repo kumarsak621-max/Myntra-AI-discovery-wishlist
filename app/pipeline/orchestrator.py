@@ -20,8 +20,24 @@ def run_analysis_pipeline(
     *,
     progress: ProgressCallback | None = None,
     analyze_limit: int | None = None,
+    only_failed: bool = False,
+    include_failed: bool = True,
 ) -> AnalysisRunResult:
-    result = analyze_new_reviews(db, progress=progress, limit=analyze_limit)
+    result = analyze_new_reviews(
+        db,
+        progress=progress,
+        limit=analyze_limit,
+        only_failed=only_failed,
+        include_failed=include_failed,
+    )
+    if result.analyzed == 0:
+        message = (
+            result.last_error
+            or "Discovery insights could not be generated because AI analysis failed."
+        )
+        if progress:
+            progress({"stage": "insights", "status": "blocked", "message": message})
+        return result
     if progress:
         progress({"stage": "themes", "status": "start"})
     discover_themes(db)

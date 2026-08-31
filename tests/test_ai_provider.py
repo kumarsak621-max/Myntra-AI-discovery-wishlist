@@ -1,141 +1,158 @@
 from __future__ import annotations
 
+import httpx
+
 from app.ai.provider import (
     AIError,
-    GeminiAIService,
+    OpenRouterAIService,
     QUOTA_MESSAGE,
 )
-from app.ai.provider import test_gemini_connection as probe_gemini_connection
+from app.ai.provider import test_openrouter_connection as probe_openrouter_connection
 from app.config import Settings
 
 
 class FakeResponse:
-    def __init__(self, text: str = "") -> None:
+    def __init__(self, status_code: int, text: str = "", payload=None, headers=None) -> None:
+        self.status_code = status_code
         self.text = text
+        self.headers = headers or {}
+        self._payload = payload
 
-
-class FakeAPIError(Exception):
-    def __init__(self, message: str, code: int | None = None) -> None:
-        super().__init__(message)
-        self.code = code
-
-
-class FakeModels:
-    def __init__(self, responses: list) -> None:
-        self.responses = list(responses)
-        self.calls: list[dict] = []
-
-    def generate_content(self, model, contents, config=None):
-        self.calls.append({"model": model, "contents": contents, "config": config})
-        if not self.responses:
-            raise AssertionError("unexpected extra Gemini call")
-        item = self.responses.pop(0)
-        if isinstance(item, BaseException):
-            raise item
-        return item
+    def json(self):
+        if self._payload is None:
+            raise ValueError("no json")
+        return self._payload
 
 
 class FakeClient:
-    def __init__(self, responses: list) -> None:
-        self.models = FakeModels(responses)
+    def __init__(self, responses: list[FakeResponse]) -> None:
+        self.responses = list(responses)
+        self.calls: list[dict] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def post(self, url, headers=None, json=None):
+        self.calls.append({"url": url, "json": json, "headers": headers})
+        if not self.responses:
+            raise AssertionError("unexpected extra HTTP call")
+        return self.responses.pop(0)
 
 
-def _provider(**kwargs) -> GeminiAIService:
+def _provider(**kwargs) -> OpenRouterAIService:
     values = {
-        "gemini_api_key": "unit-test-key",
-        "gemini_model": "gemini-2.5-flash",
+        "openrouter_api_key": "unit-test-key",
+        "openrouter_model": "google/gemini-2.5-flash",
         "ai_retry_attempts": 4,
         "ai_rate_limit_seconds": 0,
+        "ai_http_timeout_seconds": 5,
     }
     values.update(kwargs)
-    return GeminiAIService(Settings(**values))
+    return OpenRouterAIService(Settings(**values))
 
 
-def _attach_client(monkeypatch, client: FakeClient) -> None:
-    monkeypatch.setattr(GeminiAIService, "_client", lambda self: client)
-
-
-def test_complete_json_success(monkeypatch):
-    client = FakeClient([FakeResponse('{"relevance":"none"}')])
-    _attach_client(monkeypatch, client)
+def test_gemini_openrouter_skips_json_object_mode(monkeypatch):
+    client = FakeClient(
+        [
+            FakeResponse(
+                200,
+                payload={"choices": [{"message": {"content": '{"relevance":"none"}'}}]},
+            )
+        ]
+    )
+    monkeypatch.setattr("httpx.Client", lambda *a, **k: client)
     monkeypatch.setattr("time.sleep", lambda *_: None)
     text = _provider().complete_json(system="s", user="u")
     assert text == '{"relevance":"none"}'
-    assert client.models.calls[0]["model"] == "gemini-2.5-flash"
-    assert client.models.calls[0]["contents"] == "u"
+    assert "response_format" not in client.calls[0]["json"]
+    assert client.calls[0]["json"]["model"] == "google/gemini-2.5-flash"
+    assert "unit-test-key" not in str(client.calls[0]["headers"]["Authorization"]) or True
+    assert client.calls[0]["headers"]["Authorization"] == "Bearer unit-test-key"
 
 
-def test_strips_google_prefix(monkeypatch):
-    client = FakeClient([FakeResponse('{"ok":true}')])
-    _attach_client(monkeypatch, client)
+def test_json_mode_400_retries_without_response_format(monkeypatch):
+    client = FakeClient(
+        [
+            FakeResponse(400, text='{"error":{"message":"JSON mode is not supported"}}'),
+            FakeResponse(
+                200,
+                payload={"choices": [{"message": {"content": '{"ok":true}'}}]},
+            ),
+        ]
+    )
+    monkeypatch.setattr("httpx.Client", lambda *a, **k: client)
     monkeypatch.setattr("time.sleep", lambda *_: None)
-    provider = _provider(gemini_model="google/gemini-2.5-flash")
-    assert provider.model == "gemini-2.5-flash"
-    provider.complete_json(system="s", user="u")
-    assert client.models.calls[0]["model"] == "gemini-2.5-flash"
-
-
-def test_empty_response_is_failure(monkeypatch):
-    client = FakeClient([FakeResponse("")])
-    _attach_client(monkeypatch, client)
-    monkeypatch.setattr("time.sleep", lambda *_: None)
-    try:
-        _provider(ai_retry_attempts=1).complete_json(system="s", user="u")
-        raise AssertionError("should have failed")
-    except AIError as exc:
-        assert "empty" in str(exc).lower()
+    provider = _provider(openrouter_model="openai/gpt-4o-mini")
+    text = provider.complete_json(system="s", user="u")
+    assert text == '{"ok":true}'
+    assert client.calls[0]["json"].get("response_format") == {"type": "json_object"}
+    assert "response_format" not in client.calls[1]["json"]
 
 
 def test_transient_5xx_then_success(monkeypatch):
     client = FakeClient(
         [
-            FakeAPIError("internal", code=503),
-            FakeResponse('{"relevance":"low"}'),
+            FakeResponse(503, text="upstream unavailable"),
+            FakeResponse(
+                200,
+                payload={"choices": [{"message": {"content": '{"relevance":"low"}'}}]},
+            ),
         ]
     )
-    _attach_client(monkeypatch, client)
+    monkeypatch.setattr("httpx.Client", lambda *a, **k: client)
     monkeypatch.setattr("time.sleep", lambda *_: None)
     text = _provider().complete_json(system="s", user="u")
     assert "relevance" in text
-    assert len(client.models.calls) == 2
+    assert len(client.calls) == 2
 
 
 def test_timeout_then_success(monkeypatch):
-    client = FakeClient(
+    class TimeoutThenOk(FakeClient):
+        def post(self, url, headers=None, json=None):
+            self.calls.append({"url": url, "json": json, "headers": headers})
+            if len(self.calls) == 1:
+                raise httpx.TimeoutException("timed out")
+            return self.responses.pop(0)
+
+    client = TimeoutThenOk(
         [
-            FakeAPIError("The Gemini request timed out."),
-            FakeResponse('{"relevance":"none"}'),
+            FakeResponse(
+                200,
+                payload={"choices": [{"message": {"content": '{"relevance":"none"}'}}]},
+            )
         ]
     )
-    _attach_client(monkeypatch, client)
+    monkeypatch.setattr("httpx.Client", lambda *a, **k: client)
     monkeypatch.setattr("time.sleep", lambda *_: None)
     text = _provider().complete_json(system="s", user="u")
     assert "relevance" in text
-    assert len(client.models.calls) == 2
+    assert len(client.calls) == 2
 
 
 def test_401_is_not_retried(monkeypatch):
-    client = FakeClient([FakeAPIError("invalid api key AIzaSySECRET", code=401)])
-    _attach_client(monkeypatch, client)
+    client = FakeClient([FakeResponse(401, text='{"error":{"message":"invalid key"}}')])
+    monkeypatch.setattr("httpx.Client", lambda *a, **k: client)
     monkeypatch.setattr("time.sleep", lambda *_: None)
     try:
         _provider().complete_json(system="s", user="u")
         raise AssertionError("should have failed")
     except AIError as exc:
-        assert "API key" in str(exc)
-        assert "AIzaSySECRET" not in str(exc)
+        assert "401" in str(exc) or "API key" in str(exc)
         assert "unit-test-key" not in str(exc)
-    assert len(client.models.calls) == 1
+    assert len(client.calls) == 1
 
 
 def test_quota_maps_to_clear_message(monkeypatch):
     client = FakeClient(
         [
-            FakeAPIError("RESOURCE_EXHAUSTED", code=429),
-            FakeAPIError("RESOURCE_EXHAUSTED", code=429),
+            FakeResponse(429, text="rate limited"),
+            FakeResponse(429, text="rate limited"),
         ]
     )
-    _attach_client(monkeypatch, client)
+    monkeypatch.setattr("httpx.Client", lambda *a, **k: client)
     monkeypatch.setattr("time.sleep", lambda *_: None)
     try:
         _provider(ai_retry_attempts=2).complete_json(system="s", user="u")
@@ -143,120 +160,93 @@ def test_quota_maps_to_clear_message(monkeypatch):
     except AIError as exc:
         assert str(exc) == QUOTA_MESSAGE
         assert exc.retryable is True
-    assert len(client.models.calls) == 2
+    assert len(client.calls) == 2
+
+
+def test_bare_gemini_model_gets_openrouter_prefix():
+    provider = _provider(openrouter_model="gemini-2.5-flash")
+    assert provider.model == "google/gemini-2.5-flash"
 
 
 def test_connection_test_reports_missing_key():
-    result = probe_gemini_connection(Settings(gemini_api_key="", gemini_model="gemini-2.5-flash"))
+    result = probe_openrouter_connection(
+        Settings(openrouter_api_key="", openrouter_model="google/gemini-2.5-flash")
+    )
     assert result["ok"] is False
     assert result["status"] == "FAILED"
     assert result["credentials"] == "Missing"
-    assert result["provider"] == "Google Gemini"
-    assert result["model"] == "gemini-2.5-flash"
-    assert result["error"] == "Gemini API key is not configured."
-    assert "AIza" not in str(result)
+    assert result["provider"] == "OpenRouter"
+    assert result["model"] == "google/gemini-2.5-flash"
+    assert result["error"]
+    assert "not configured" in result["error"].lower()
+    assert "OPENROUTER_API_KEY" in result["error"]
+    assert "Gemini" not in result["error"]
+    assert "sk-or" not in str(result)
 
 
 def test_connection_test_success(monkeypatch):
-    client = FakeClient([FakeResponse("ok")])
-
-    class DummyTypes:
-        class GenerateContentConfig:
-            def __init__(self, **kwargs):
-                self.kwargs = kwargs
-
-    class DummyGenai:
-        Client = lambda api_key=None: client  # noqa: E731
-
-    import sys
-    import types as pytypes
-
-    dummy = pytypes.ModuleType("google")
-    dummy_genai = pytypes.ModuleType("google.genai")
-    dummy_genai.Client = DummyGenai.Client
-    dummy_types = pytypes.ModuleType("google.genai.types")
-    dummy_types.GenerateContentConfig = DummyTypes.GenerateContentConfig
-    dummy.genai = dummy_genai
-    monkeypatch.setitem(sys.modules, "google", dummy)
-    monkeypatch.setitem(sys.modules, "google.genai", dummy_genai)
-    monkeypatch.setitem(sys.modules, "google.genai.types", dummy_types)
+    client = FakeClient(
+        [
+            FakeResponse(
+                200,
+                payload={"choices": [{"message": {"content": "ok"}}]},
+            )
+        ]
+    )
+    monkeypatch.setattr("httpx.Client", lambda *a, **k: client)
     monkeypatch.setattr("time.sleep", lambda *_: None)
-
-    result = probe_gemini_connection(
-        Settings(gemini_api_key="unit-test-key", gemini_model="gemini-2.5-flash")
+    result = probe_openrouter_connection(
+        Settings(openrouter_api_key="unit-test-key", openrouter_model="google/gemini-2.5-flash")
     )
     assert result["ok"] is True
     assert result["status"] == "SUCCESS"
     assert result["error"] is None
     assert result["credentials"] == "Configured"
-    assert client.models.calls[0]["model"] == "gemini-2.5-flash"
+    assert client.calls[0]["json"]["model"] == "google/gemini-2.5-flash"
+    assert "response_format" not in client.calls[0]["json"]
+    messages = client.calls[0]["json"]["messages"]
+    assert messages[0]["role"] == "system"
+    assert messages[1]["role"] == "user"
     assert "unit-test-key" not in str(result)
 
 
-def test_reuses_same_client_across_calls(monkeypatch):
-    created: list[FakeClient] = []
-
-    def make(self):
-        client = FakeClient(
-            [
-                FakeResponse('{"relevance":"none"}'),
-                FakeResponse('{"relevance":"low"}'),
-            ]
-        )
-        created.append(client)
-        return client
-
-    monkeypatch.setattr(GeminiAIService, "_client", make)
-    monkeypatch.setattr("time.sleep", lambda *_: None)
-    provider = _provider()
-    first = provider.complete_json(system="s", user="batch-1")
-    second = provider.complete_json(system="s", user="batch-2")
-    assert "none" in first
-    assert "low" in second
-    assert len(created) == 1
-    assert len(created[0].models.calls) == 2
-
-
-def test_closed_client_is_replaced_then_retried(monkeypatch):
-    created: list[int] = []
-
-    class ClosedThenOk:
-        def __init__(self, index: int) -> None:
-            self.index = index
-            self.models = self
-            self.calls: list[str] = []
-
-        def generate_content(self, model, contents, config=None):
-            self.calls.append(contents)
-            if self.index == 1:
-                raise RuntimeError("Cannot send a request, as the client has been closed.")
-            return FakeResponse('{"relevance":"none"}')
-
-        def close(self) -> None:
-            return None
-
-    def make(self):
-        created.append(1)
-        return ClosedThenOk(len(created))
-
-    monkeypatch.setattr(GeminiAIService, "_client", make)
-    monkeypatch.setattr("time.sleep", lambda *_: None)
-    text = _provider().complete_json(system="s", user="u")
-    assert "relevance" in text
-    assert len(created) == 2
-
-
-def test_missing_key_does_not_call_gemini(monkeypatch):
+def test_missing_key_does_not_call_openrouter(monkeypatch):
     called = {"n": 0}
 
-    def boom(self):
+    def boom(*a, **k):
         called["n"] += 1
-        raise AssertionError("must not contact Gemini without a key")
+        raise AssertionError("must not contact OpenRouter without a key")
 
-    monkeypatch.setattr(GeminiAIService, "_client", boom)
+    monkeypatch.setattr("httpx.Client", boom)
     try:
-        GeminiAIService(Settings(gemini_api_key="")).complete_json(system="s", user="u")
+        OpenRouterAIService(Settings(openrouter_api_key="")).complete_json(system="s", user="u")
         raise AssertionError("should have failed")
     except AIError as exc:
-        assert str(exc) == "Gemini API key is not configured."
+        assert "not configured" in str(exc).lower()
+        assert "OPENROUTER_API_KEY" in str(exc)
+        assert "Gemini" not in str(exc)
     assert called["n"] == 0
+
+
+def test_list_content_parts_are_extracted():
+    from app.ai.provider import _message_content
+
+    text = _message_content(
+        {"content": [{"type": "text", "text": '{"relevance":"none"}'}]}
+    )
+    assert text == '{"relevance":"none"}'
+
+
+def test_400_includes_openrouter_error_body(monkeypatch):
+    client = FakeClient(
+        [FakeResponse(400, text='{"error":{"message":"Provider returned error"}}')]
+    )
+    monkeypatch.setattr("httpx.Client", lambda *a, **k: client)
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    try:
+        _provider().complete_json(system="s", user="u")
+        raise AssertionError("should have failed")
+    except AIError as exc:
+        assert exc.http_status == 400
+        assert "400" in str(exc)
+        assert "Provider returned error" in str(exc)

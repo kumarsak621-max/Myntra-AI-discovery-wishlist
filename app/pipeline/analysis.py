@@ -1,4 +1,4 @@
-"""Per-review AI analysis with batched Gemini calls and content-hash caching."""
+"""Per-review AI analysis with batched OpenRouter calls and content-hash caching."""
 
 from __future__ import annotations
 
@@ -41,10 +41,23 @@ def _original_blob(review: Review) -> str:
 
 def _request_batch_size(settings) -> int:
     try:
-        size = int(getattr(settings, "ai_request_batch_size", 10) or 10)
+        alias = getattr(settings, "ai_batch_size", None)
+        size = int(alias or getattr(settings, "ai_request_batch_size", 5) or 5)
     except (TypeError, ValueError):
-        size = 10
+        size = 5
     return max(1, min(10, size))
+
+
+def smoke_test_analyze_limit(db: Session, settings) -> int:
+    """First successful analysis run is capped at 5 real reviews."""
+    from app.database import get_database_diagnostics
+
+    configured = int(getattr(settings, "ai_analysis_batch_size", 60) or 60)
+    configured = max(1, configured)
+    diag = get_database_diagnostics(db)
+    if int(diag.get("analyzed_reviews") or 0) == 0:
+        return min(configured, 5)
+    return configured
 
 
 def _chunks(items: Sequence[Review], size: int) -> list[list[Review]]:
@@ -109,8 +122,18 @@ def persist_analysis(
     return row
 
 
-def reviews_needing_analysis(db: Session) -> list[Review]:
-    """Skip only successfully analyzed reviews. Failed and pending rows are retried."""
+def reviews_needing_analysis(
+    db: Session,
+    *,
+    only_failed: bool = False,
+    include_failed: bool = True,
+) -> list[Review]:
+    """Select Myntra-valid reviews that still need OpenRouter analysis.
+
+    Analyze Pending: pending / missing / stale-hash rows (include_failed=False).
+    Retry Failed: only status=failed (only_failed=True).
+    Default pipeline: pending and failed, never successfully analyzed rows.
+    """
     rows = (
         db.query(Review)
         .filter(
@@ -123,13 +146,20 @@ def reviews_needing_analysis(db: Session) -> list[Review]:
     needed: list[Review] = []
     for review in rows:
         analysis = review.analysis
-        if analysis is None or getattr(analysis, "status", "") in {"", "pending"}:
+        status = getattr(analysis, "status", "") if analysis is not None else ""
+        if only_failed:
+            if analysis is not None and status == "failed":
+                needed.append(review)
+            continue
+        if analysis is None or status in {"", "pending"}:
             needed.append(review)
             continue
         if analysis.content_hash != review.content_hash:
             needed.append(review)
             continue
-        if analysis.status == "analyzed" and analysis.is_valid_json:
+        if status == "analyzed" and analysis.is_valid_json:
+            continue
+        if status == "failed" and not include_failed:
             continue
         needed.append(review)
     return needed
@@ -242,10 +272,14 @@ def analyze_new_reviews(
     progress: ProgressCallback | None = None,
     limit: int | None = None,
     provider: AIProvider | None = None,
+    only_failed: bool = False,
+    include_failed: bool = True,
 ) -> AnalysisRunResult:
     provider = provider or AIProvider(get_settings())
     settings = getattr(provider, "settings", None) or get_settings()
-    pending = reviews_needing_analysis(db)
+    pending = reviews_needing_analysis(
+        db, only_failed=only_failed, include_failed=include_failed
+    )
     total_pending = len(pending)
     if limit is not None:
         pending = pending[:limit]
@@ -265,7 +299,8 @@ def analyze_new_reviews(
 
     if not provider.available():
         message = (
-            "Gemini API key is not configured. "
+            "OpenRouter API key is not configured. "
+            "Add OPENROUTER_API_KEY to Streamlit Secrets or .env. "
             f"{total_pending} real Myntra-valid reviews are waiting for analysis."
         )
         logger.error(message)
