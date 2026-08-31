@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Myntra Discovery Engine — Wishlist to Purchase</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Newsreader:opsz,wght@6..72,500;6..72,600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="rail">
+      <div class="brand">
+        <div class="brand-mark">M</div>
+        <div>
+          <div class="brand-kicker">Growth discovery</div>
+          <div class="brand-name">Wishlist → Purchase</div>
+        </div>
+      </div>
+      <nav id="nav"></nav>
+      <div class="rail-foot">
+        <p>Discovers the problem. Does not propose the feature.</p>
+      </div>
+    </aside>
+    <main>
+      <header class="topbar">
+        <div>
+          <h1 id="page-title">Overview</h1>
+          <p id="page-sub" class="muted">Why wishlisted products fail to convert within 30 days.</p>
+        </div>
+        <div class="top-actions">
+          <label class="toggle">
+            <input type="checkbox" id="myntra-only" checked />
+            Myntra-valid evidence only
+          </label>
+          <button class="btn primary" id="btn-collect-all" type="button">Collect New Data</button>
+        </div>
+      </header>
+      <div id="source-banners" class="banners"></div>
+      <section id="view" class="view"></section>
+    </main>
+  </div>
+  <aside id="drawer" class="drawer" hidden>
+    <div class="drawer-head">
+      <h2 id="drawer-title">Evidence</h2>
+      <button type="button" class="icon-btn" id="drawer-close">Close</button>
+    </div>
+    <div id="drawer-body" class="drawer-body"></div>
+  </aside>
+  <script src="/static/app.js"></script>
+</body>
+</html>

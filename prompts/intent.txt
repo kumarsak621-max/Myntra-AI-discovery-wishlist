@@ -1,0 +1,2 @@
+Extract wishlist / save motivations only when evidenced in the review text.
+Do not assume a default taxonomy. Discover labels from the text.

@@ -1,0 +1,153 @@
+:root {
+  --bg: #111318;
+  --bg-2: #171a21;
+  --surface: #1e222c;
+  --surface-2: #252a36;
+  --line: #323846;
+  --text: #eef0f4;
+  --muted: #9aa3b2;
+  --pink: #ff3f6c;
+  --pink-dim: rgba(255, 63, 108, 0.14);
+  --amber: #e8b86d;
+  --amber-dim: rgba(232, 184, 109, 0.12);
+  --green: #7dcea0;
+  --red: #f07178;
+  --blue: #8ab4ff;
+  --rail: 268px;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  letter-spacing: 0.01em;
+}
+
+.app-shell { display: flex; min-height: 100%; }
+.rail {
+  width: var(--rail);
+  background: #0d0f14;
+  border-right: 1px solid var(--line);
+  padding: 22px 16px;
+  display: flex;
+  flex-direction: column;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+}
+.brand { display: flex; gap: 12px; align-items: center; margin-bottom: 28px; }
+.brand-mark {
+  width: 40px; height: 40px; border-radius: 10px;
+  background: var(--pink); color: white;
+  display: grid; place-items: center;
+  font-family: Newsreader, serif; font-size: 22px;
+}
+.brand-kicker { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.14em; }
+.brand-name { font-family: Newsreader, serif; font-size: 18px; }
+nav { display: flex; flex-direction: column; gap: 2px; overflow: auto; }
+nav a {
+  color: var(--muted); text-decoration: none;
+  padding: 8px 10px; border-radius: 8px; font-size: 13.5px;
+}
+nav a:hover { background: var(--surface); color: var(--text); }
+nav a.active { background: var(--pink-dim); color: var(--pink); }
+.card a { color: var(--blue); }
+.rail-foot { margin-top: auto; color: var(--muted); font-size: 12px; line-height: 1.45; }
+
+main { flex: 1; min-width: 0; padding: 22px 28px 60px; }
+.topbar { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; margin-bottom: 16px; }
+h1 { font-family: Newsreader, serif; font-weight: 500; font-size: 32px; margin: 0 0 4px; }
+.muted { color: var(--muted); margin: 0; }
+.top-actions { display: flex; gap: 12px; align-items: center; }
+
+.btn {
+  border: 1px solid var(--line); background: var(--surface);
+  color: var(--text); padding: 8px 14px; border-radius: 8px;
+  cursor: pointer; font: inherit;
+}
+.btn:hover { border-color: #4a5162; }
+.btn.primary { background: var(--pink); border-color: var(--pink); color: white; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.icon-btn { background: transparent; border: 0; color: var(--muted); cursor: pointer; font: inherit; }
+
+.toggle { display: flex; gap: 8px; align-items: center; font-size: 13px; color: var(--muted); }
+
+.banners { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
+.banner {
+  padding: 10px 14px; border-radius: 10px; font-size: 13px; line-height: 1.45;
+  border: 1px solid var(--line);
+}
+.banner.warn { background: var(--amber-dim); border-color: #6d542c; color: var(--amber); }
+.banner.ok { background: rgba(125, 206, 160, 0.08); border-color: #2f5a44; color: var(--green); }
+.banner.bad { background: rgba(240, 113, 120, 0.1); border-color: #6a3034; color: var(--red); }
+
+.grid { display: grid; gap: 14px; }
+.grid.cols-4 { grid-template-columns: repeat(4, 1fr); }
+.grid.cols-3 { grid-template-columns: repeat(3, 1fr); }
+.grid.cols-2 { grid-template-columns: repeat(2, 1fr); }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 16px;
+}
+.card h3 { margin: 0 0 10px; font-size: 14px; color: var(--muted); font-weight: 500; letter-spacing: 0.08em; text-transform: uppercase; }
+.stat { font-family: Newsreader, serif; font-size: 34px; }
+.stat-sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+
+.table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+.table th { text-align: left; color: var(--muted); font-weight: 500; padding: 8px; border-bottom: 1px solid var(--line); }
+.table td { padding: 9px 8px; border-bottom: 1px solid #2a2f3b; vertical-align: top; }
+.table tr { cursor: pointer; }
+.table tr:hover { background: var(--surface-2); }
+
+.chip {
+  display: inline-block; padding: 2px 8px; border-radius: 999px;
+  font-size: 11px; border: 1px solid var(--line); color: var(--muted);
+}
+.chip.pink { color: var(--pink); border-color: #7a2a40; background: var(--pink-dim); }
+.chip.amber { color: var(--amber); border-color: #6d542c; background: var(--amber-dim); }
+.chip.green { color: var(--green); border-color: #2f5a44; }
+
+.filters { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+input, select {
+  background: var(--bg-2); color: var(--text); border: 1px solid var(--line);
+  border-radius: 8px; padding: 8px 10px; font: inherit;
+}
+.quote {
+  font-family: Newsreader, serif; font-size: 17px; line-height: 1.45;
+  margin: 0 0 8px;
+}
+.meta { font-family: "IBM Plex Mono", monospace; font-size: 11px; color: var(--muted); }
+.log {
+  font-family: "IBM Plex Mono", monospace; font-size: 12px;
+  background: #0d0f14; border-radius: 10px; padding: 12px;
+  max-height: 280px; overflow: auto; white-space: pre-wrap;
+}
+.bar { height: 8px; background: #2a2f3b; border-radius: 99px; overflow: hidden; }
+.bar > span { display: block; height: 100%; background: var(--pink); }
+.score { font-family: "IBM Plex Mono", monospace; color: var(--pink); }
+
+.drawer {
+  position: fixed; top: 0; right: 0; width: min(520px, 100%);
+  height: 100%; background: var(--bg-2); border-left: 1px solid var(--line);
+  padding: 18px; overflow: auto; z-index: 20;
+}
+.drawer-head { display: flex; justify-content: space-between; align-items: center; }
+.evidence-item { border-top: 1px solid var(--line); padding: 14px 0; }
+
+.report h2 { font-family: Newsreader, serif; font-weight: 500; margin: 28px 0 10px; }
+.report p, .report li { line-height: 1.55; color: #d5dae3; }
+.empty { color: var(--muted); padding: 24px; text-align: center; }
+
+@media (max-width: 1100px) {
+  .grid.cols-4, .grid.cols-3 { grid-template-columns: repeat(2, 1fr); }
+  .rail { display: none; }
+}
+@media (max-width: 720px) {
+  .grid.cols-4, .grid.cols-3, .grid.cols-2 { grid-template-columns: 1fr; }
+  .topbar { flex-direction: column; }
+}

@@ -1,0 +1,2 @@
+Extract purchase barriers only when evidenced in the review text.
+Do not assume fit, price, or reviews are the main problem.

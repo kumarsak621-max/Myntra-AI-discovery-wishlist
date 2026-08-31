@@ -1,0 +1,3 @@
+Synthesize findings without proposing a product solution.
+Distinguish what we know from what we do not know.
+Every claim must be traceable to source reviews.
