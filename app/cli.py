@@ -37,8 +37,16 @@ def main() -> None:
         elif args.cmd == "analyze":
             from app.pipeline.orchestrator import run_analysis_pipeline
 
-            n = run_analysis_pipeline(db)
-            print(json.dumps({"analyzed": n}))
+            result = run_analysis_pipeline(db)
+            print(
+                json.dumps(
+                    {
+                        "analyzed": result.analyzed,
+                        "failed": result.failed,
+                        "last_error": result.last_error or None,
+                    }
+                )
+            )
     finally:
         db.close()
 

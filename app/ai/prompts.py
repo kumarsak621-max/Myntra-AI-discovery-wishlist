@@ -95,7 +95,72 @@ Rules:
 - intent/barriers/uncertainties must be discovered from THIS text. Do not dump a default taxonomy.
 - Example intent hypotheses (do NOT assume): genuine purchase intent, bookmarking, future purchase, comparison, occasion planning, outfit planning, price consideration, size uncertainty, sharing, inspiration, fear of losing the product, product tracking.
 - Example barriers (do NOT assume they apply): fit, size, material, quality, color, appearance, reviews, ratings, user photos, returns, exchanges, delivery, availability, trust, styling, occasion, social validation, decision fatigue, comparison, price/value, waiting, lack of urgency, better alternatives, preference change.
+- If the review contains no wishlist evidence, set wishlist_signal to "none". Do not assume every Myntra review is a wishlist review.
+- Do not force every review into every category. Leave arrays empty when the text does not support them.
 - evidence_strength and confidence are integers 1-5.
 - quote fields MUST be exact substrings of the review text, or empty.
 - Sentiment is secondary. Preserve interest + hesitation + uncertainty when all are present. Never collapse a mixed review to sentiment=positive.
+"""
+
+
+ANALYSIS_ITEM_SCHEMA = """{
+  "id": "the review id supplied below",
+  "relevance": "high|medium|low|none",
+  "wishlist_signal": "explicit|implicit|none",
+  "purchase_signal": "purchased|intend_to_purchase|hesitant|abandoned|none",
+  "purchase_hesitation": "explicit|implicit|none",
+  "intent": [],
+  "barriers": [],
+  "uncertainties": [],
+  "information_seeking": [],
+  "behavioral_signals": [],
+  "product_category": [],
+  "decision_factors": [],
+  "root_cause": {"observed": "", "inferred": "", "hypothesized": "", "statement": ""},
+  "sentiment": "positive|negative|mixed|neutral",
+  "evidence_strength": 1,
+  "confidence": 1
+}"""
+
+
+def analysis_batch_user_prompt(items: list[dict]) -> str:
+    blocks = []
+    for item in items:
+        blocks.append(
+            "\n".join(
+                [
+                    f"REVIEW ID: {item['id']}",
+                    f"SOURCE: {item.get('source') or ''}",
+                    f"APP NAME: {item.get('app_name') or ''}",
+                    f"DATA CLASSIFICATION: {item.get('data_classification') or ''}",
+                    f"REGION: {item.get('region') or ''}",
+                    f"RATING: {item.get('rating') if item.get('rating') is not None else 'unknown'}",
+                    f"TITLE: {item.get('title') or '(none)'}",
+                    "TEXT:",
+                    item.get("text") or "",
+                ]
+            )
+        )
+    joined = "\n\n-----\n\n".join(blocks)
+    return f"""Analyze EACH public app review below for wishlist-to-purchase discovery research.
+
+Return ONLY JSON in this shape:
+{{
+  "results": [
+    {ANALYSIS_ITEM_SCHEMA}
+  ]
+}}
+
+Rules:
+- Include one results[] object per review, using the supplied REVIEW ID as "id".
+- intent/barriers/uncertainties must come from that review's text. Do not invent quotes.
+- If a review is unrelated to shopping/wishlist/purchase, set relevance to "none" or "low" and leave arrays empty.
+- If a review contains no wishlist evidence, set wishlist_signal to "none". Do not assume every Myntra review is a wishlist review.
+- Do not force every review into every category.
+- evidence_strength and confidence are integers 1-5.
+- quote fields MUST be exact substrings of that review, or empty.
+
+REVIEWS:
+
+{joined}
 """

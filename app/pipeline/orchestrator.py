@@ -7,7 +7,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.pipeline.analysis import analyze_new_reviews
+from app.pipeline.analysis import AnalysisRunResult, analyze_new_reviews
 from app.pipeline.clustering import discover_themes
 from app.pipeline.opportunities import rebuild_opportunities
 from app.pipeline.segmentation import discover_segments
@@ -20,8 +20,8 @@ def run_analysis_pipeline(
     *,
     progress: ProgressCallback | None = None,
     analyze_limit: int | None = None,
-) -> int:
-    analyzed = analyze_new_reviews(db, progress=progress, limit=analyze_limit)
+) -> AnalysisRunResult:
+    result = analyze_new_reviews(db, progress=progress, limit=analyze_limit)
     if progress:
         progress({"stage": "themes", "status": "start"})
     discover_themes(db)
@@ -32,5 +32,13 @@ def run_analysis_pipeline(
         progress({"stage": "opportunities", "status": "start"})
     rebuild_opportunities(db)
     if progress:
-        progress({"stage": "pipeline", "status": "complete", "analyzed": analyzed})
-    return analyzed
+        progress(
+            {
+                "stage": "pipeline",
+                "status": "complete",
+                "analyzed": result.analyzed,
+                "failed": result.failed,
+                "message": result.last_error,
+            }
+        )
+    return result

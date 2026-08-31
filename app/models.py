@@ -142,6 +142,7 @@ class Analysis(Base):
     analyzed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     status: Mapped[str] = mapped_column(String(32), default="pending")
     analysis_version: Mapped[str] = mapped_column(String(32), default="1")
+    http_status: Mapped[int] = mapped_column(Integer, default=0)
 
     review: Mapped[Review] = relationship(back_populates="analysis")
 

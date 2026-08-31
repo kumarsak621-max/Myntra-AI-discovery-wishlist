@@ -65,6 +65,8 @@ class Settings(BaseSettings):
     ai_max_review_chars: int = 4000
     ai_rate_limit_seconds: float = 0.4
     ai_analysis_batch_size: int = 60
+    ai_request_batch_size: int = 10
+    ai_retry_attempts: int = 5
 
     host: str = "127.0.0.1"
     port: int = 8000

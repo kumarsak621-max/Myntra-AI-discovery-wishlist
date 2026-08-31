@@ -117,6 +117,15 @@ class ReviewAnalysisSchema(BaseModel):
     evidence_strength: int = Field(default=1, ge=1, le=5)
     confidence: int = Field(default=1, ge=1, le=5)
 
+    @field_validator("wishlist_signal", mode="before")
+    @classmethod
+    def _wishlist_signal(cls, value: Any) -> str:
+        if value in {False, 0, "0", "false", "False", "none", "None", None, ""}:
+            return "none"
+        if value in {True, 1, "1", "true", "True"}:
+            return "implicit"
+        return value
+
     @field_validator("intent", "barriers", "uncertainties", "product_category", "decision_factors")
     @classmethod
     def _strip_empty(cls, value: list[str]) -> list[str]:

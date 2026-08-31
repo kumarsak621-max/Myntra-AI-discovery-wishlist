@@ -62,10 +62,10 @@ RULES = [
         lambda a, signals, intents: "return_concern" in signals
         or any("return" in b.lower() or "exchange" in b.lower() for b in _loads(a.barriers_json)),
     ),
-    (
-        "Wishlist / save mentioners",
-        "explicit" if False else "inferred",
-        "Users who mention wishlist, save, or bag as a holding pattern.",
+        (
+            "Wishlist / save mentioners",
+            "inferred",
+            "Users who mention wishlist, save, or bag as a holding pattern.",
         lambda a, signals, intents: a.wishlist_signal in {"explicit", "implicit"}
         or any("wishlist" in i.lower() or "save" in i.lower() for i in intents),
     ),

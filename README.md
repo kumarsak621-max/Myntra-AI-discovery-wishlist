@@ -148,9 +148,43 @@ score = reach × frequency × purchase_impact × severity × evidence_confidence
 
 Each dimension is 1–5.
 
-AI analysis is cached by review content hash. Unchanged reviews are not sent to the model again. New reviews are stored as `pending` and only those rows are analyzed (in batches of `AI_ANALYSIS_BATCH_SIZE`, default 60, so Streamlit Cloud requests do not time out). Click **Run Full Discovery Pipeline** again to continue pending reviews.
+AI analysis is cached by review content hash. Unchanged `analyzed` reviews are not sent to the model again. New reviews are stored as `pending`. Failed reviews are retried. OpenRouter requests use batches of `AI_REQUEST_BATCH_SIZE` (default **10**). A pipeline run processes up to `AI_ANALYSIS_BATCH_SIZE` (default 60) pending reviews so Streamlit Cloud requests do not time out. Click **Analyze Pending Reviews** or **Run Full Discovery Pipeline** again to continue.
 
-If discovery pages say analysis has not run, that means reviews are stored but `OPENROUTER_API_KEY` is missing or analysis has not been executed yet — not that there are zero reviews.
+If discovery pages are empty, Live Data explains the actual reason (no reviews, pending analysis, missing API key, or a stored analysis error). It never treats stored reviews as “no data collected.”
+
+On **Live Data** use **Test AI Connection** to send a minimal OpenRouter request. Success is reported only when that request succeeds. The API key is shown only as Configured / Missing.
+
+## Full discovery
+
+**🚀 Run Full Discovery Pipeline** (Overview / Live Data) runs:
+
+1. Collect Google Play last 30 days  
+2. Collect Apple App Store last 30 days (India, then US fallback)  
+3. Normalize, deduplicate, store  
+4. Analyze pending reviews with OpenRouter  
+5. Rebuild themes, segments, and opportunity scores  
+6. Refresh the dashboard  
+
+A failed batch does not mark every pending review as failed.
+
+## Diagnostics
+
+```bash
+python -m utils.diagnostics
+```
+
+Prints database path and counts, collector status, OpenRouter configuration (never the key), connection test result, and discovery table counts.
+
+## Troubleshooting
+
+| Symptom | What it actually means |
+| --- | --- |
+| No reviews have been collected yet. | Database has 0 stored reviews. Click Collect Last 30 Days. |
+| X real reviews are awaiting AI analysis. | Reviews are stored as `pending`. Set `OPENROUTER_API_KEY`, Test AI Connection, then Analyze Pending Reviews. |
+| AI analysis failed for X reviews. | Per-review `failed` rows exist. Open Live Data for `Last error` / HTTP status. Failed rows are retried. |
+| OpenRouter API key is not configured. | Missing from `.env` locally or Streamlit Secrets in the cloud. |
+| Google Play collection failed | The scraper was blocked or the store request failed. The safe error is shown; Apple RSS may still succeed. |
+| Streamlit Cloud empty after reboot | Local SQLite is ephemeral on Cloud. Collect again after restart. |
 
 ## Dashboard
 
@@ -197,6 +231,7 @@ Python version: 3.12 (`runtime.txt`).
 
 ```bash
 pytest -q
+python -m utils.diagnostics
 ```
 
 ## Security

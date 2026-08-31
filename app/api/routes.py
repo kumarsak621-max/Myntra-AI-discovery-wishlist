@@ -415,8 +415,12 @@ def collect_stream(
 
 @router.post("/analyze")
 def analyze(db: Session = Depends(get_db)) -> dict[str, Any]:
-    analyzed = run_analysis_pipeline(db)
-    return {"analyzed": analyzed}
+    result = run_analysis_pipeline(db)
+    return {
+        "analyzed": result.analyzed,
+        "failed": result.failed,
+        "last_error": result.last_error or None,
+    }
 
 
 @router.get("/reviews")

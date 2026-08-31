@@ -14,7 +14,16 @@ import streamlit as st
 from sqlalchemy.orm import Session
 
 from app.api.routes import serialize_review
-from app.database import SessionLocal, get_database_diagnostics, get_review_count, get_review_stats, init_db, sqlite_path
+from app.database import (
+    SessionLocal,
+    get_ai_diagnostics,
+    get_database_diagnostics,
+    get_review_count,
+    get_review_stats,
+    init_db,
+    migrate_schema,
+    sqlite_path,
+)
 from app.models import Analysis, CollectionRun, Opportunity, Review, Segment, Theme
 from app.pipeline.dates import get_last_30_days_cutoff, humanize_ago, window_start
 from app.pipeline.quantification import (
@@ -55,11 +64,18 @@ PAGES = [
 ]
 
 EMPTY = "No reviews have been collected yet."
-NO_ANALYSIS = "Not enough real feedback collected for analysis."
 NEAR_REALTIME = "Near-real-time — refreshed from the public source"
 
 
-def _analysis_blocker(*, stored: int, analyzed: int, pending: int, failed: int, ai_ok: bool) -> str | None:
+def _analysis_blocker(
+    *,
+    stored: int,
+    analyzed: int,
+    pending: int,
+    failed: int,
+    ai_ok: bool,
+    last_error: str = "",
+) -> str | None:
     """Explain why discovery pages are empty. Never hide stored reviews behind a fake empty corpus."""
     if stored == 0:
         return EMPTY
@@ -68,17 +84,19 @@ def _analysis_blocker(*, stored: int, analyzed: int, pending: int, failed: int, 
     if not ai_ok:
         return (
             f"{stored} real reviews are stored, but none have been analyzed. "
-            "AI analysis failed: OPENROUTER_API_KEY is not set in Streamlit Secrets or .env. "
-            "Set the key, then click 🚀 Run Full Discovery Pipeline."
+            "OpenRouter API key is not configured. "
+            "Set OPENROUTER_API_KEY in Streamlit Secrets or .env, then click Test AI Connection."
         )
     if failed and not analyzed:
+        extra = f" Last error: {last_error}." if last_error else ""
         return (
-            f"AI analysis failed for {failed} reviews. "
-            "Open Live Data for the error, then retry Run Full Discovery Pipeline."
+            f"AI analysis failed for {failed} reviews.{extra} "
+            "See Live Data for the actual error."
         )
+    waiting = pending or stored
     return (
-        f"{stored} real reviews are stored ({pending} pending analysis). "
-        "Click 🚀 Run Full Discovery Pipeline to analyze them with OpenRouter."
+        f"{waiting} real reviews are awaiting AI analysis. "
+        "Click Test AI Connection, then Analyze Pending Reviews or 🚀 Run Full Discovery Pipeline."
     )
 
 
@@ -104,14 +122,25 @@ def _empty_notice(count: int, *, need_analysis: bool = False) -> bool:
         st.info(EMPTY)
         return True
     if need_analysis:
-        st.info(NO_ANALYSIS)
-        return True
+        diag = get_database_diagnostics()
+        msg = _analysis_blocker(
+            stored=count,
+            analyzed=diag.get("analyzed_reviews") or 0,
+            pending=diag.get("pending_reviews") or 0,
+            failed=diag.get("failed_reviews") or 0,
+            ai_ok=get_settings().has_ai_credentials,
+            last_error=str(diag.get("last_analysis_error") or ""),
+        )
+        if msg:
+            (st.info if msg == EMPTY else st.warning)(msg)
+            return True
     return False
 
 
 def render() -> None:
     st.set_page_config(page_title="Myntra Discovery Engine", layout="wide")
     _bootstrap()
+    migrate_schema()
     reload_settings()
     settings = get_settings()
 
@@ -135,7 +164,7 @@ def render() -> None:
         get_review_count(since=get_last_30_days_cutoff(), myntra_only=myntra_only),
     )
     st.sidebar.markdown("**AI**")
-    st.sidebar.write("OpenRouter key:", "configured" if ai_ok else "missing")
+    st.sidebar.write("API key:", "Configured" if ai_ok else "Missing")
     st.sidebar.write("Model:", settings.resolved_model)
     diag = get_database_diagnostics()
     st.sidebar.markdown("**Analysis**")
@@ -290,6 +319,7 @@ def _overview(myntra_only: bool, ai_ok: bool) -> None:
             pending=diag.get("pending_reviews") or 0,
             failed=diag.get("failed_reviews") or 0,
             ai_ok=ai_ok,
+            last_error=str(diag.get("last_analysis_error") or ""),
         )
         if msg:
             st.warning(msg) if msg != EMPTY else st.info(msg)
@@ -538,6 +568,86 @@ def _diagnostics() -> None:
         st.error(f"Last collection run failed: {latest.notes}")
 
 
+def _ai_analysis_status_panel(ai_ok: bool) -> None:
+    from app.ai.provider import test_openrouter_connection
+
+    reload_settings()
+    ai = get_ai_diagnostics()
+    st.subheader("AI ANALYSIS STATUS")
+    st.write("Provider:")
+    st.write(ai.get("ai_provider") or "OpenRouter")
+    st.write("Model:")
+    st.write(ai.get("ai_model") or "google/gemini-2.5-flash")
+    st.write("API key:")
+    st.write("Configured" if ai.get("api_key_configured") == "YES" else "Missing")
+    st.write("Pending:")
+    st.write(ai.get("pending_reviews"))
+    st.write("Analyzed:")
+    st.write(ai.get("analyzed_reviews"))
+    st.write("Failed:")
+    st.write(ai.get("failed_reviews"))
+    st.write("Last successful analysis:")
+    st.write(ai.get("last_successful_analysis") or "None")
+    st.write("Last failure:")
+    st.write(ai.get("last_failed_analysis") or "None")
+    st.write("Last error:")
+    st.write(ai.get("last_error") or "None")
+    if ai.get("last_http_status"):
+        st.write("Last HTTP status:")
+        st.write(ai.get("last_http_status"))
+    st.caption("API key is never displayed.")
+
+    test_col, analyze_col = st.columns(2)
+    with test_col:
+        run_test = st.button("Test AI Connection")
+    with analyze_col:
+        run_pending = st.button("Analyze Pending Reviews", key="analyze_pending_status")
+    if run_test:
+        with st.spinner("Testing OpenRouter connection…"):
+            probe = test_openrouter_connection()
+        st.session_state["ai_connection_test"] = probe
+        st.subheader("AI CONNECTION TEST")
+        st.write("Provider:")
+        st.write(probe.get("provider") or "OpenRouter")
+        st.write("Model:")
+        st.write(probe.get("model") or "")
+        st.write("Credentials:")
+        st.write(probe.get("credentials") or "Missing")
+        st.write("Status:")
+        st.write(probe.get("status") or "FAILED")
+        st.write("HTTP status:")
+        st.write(probe.get("http_status") if probe.get("http_status") is not None else "N/A")
+        st.write("Error:")
+        st.write(probe.get("error") or "None")
+        if probe.get("ok"):
+            st.success("OpenRouter accepted a live test request.")
+        else:
+            st.error(probe.get("error") or "OpenRouter connection test failed.")
+    elif st.session_state.get("ai_connection_test"):
+        probe = st.session_state["ai_connection_test"]
+        st.subheader("AI CONNECTION TEST")
+        st.write("Provider:")
+        st.write(probe.get("provider") or "OpenRouter")
+        st.write("Model:")
+        st.write(probe.get("model") or "")
+        st.write("Credentials:")
+        st.write(probe.get("credentials") or "Missing")
+        st.write("Status:")
+        st.write(probe.get("status") or "FAILED")
+        st.write("HTTP status:")
+        st.write(probe.get("http_status") if probe.get("http_status") is not None else "N/A")
+        st.write("Error:")
+        st.write(probe.get("error") or "None")
+    if run_pending:
+        reload_settings()
+        if not get_settings().has_ai_credentials:
+            st.error("OpenRouter API key is not configured.")
+        elif get_review_count() == 0:
+            st.info(EMPTY)
+        else:
+            _run_analyze()
+
+
 def _live_data(ai_ok: bool) -> None:
     st.title("Live Data")
     st.caption(NEAR_REALTIME)
@@ -567,6 +677,7 @@ def _live_data(ai_ok: bool) -> None:
     _show_last_collection()
     _diagnostics()
     _pipeline_status_panel()
+    _ai_analysis_status_panel(ai_ok)
     diag = get_database_diagnostics()
     st.subheader("DATABASE DIAGNOSTICS")
     st.write("Total reviews:", diag.get("total_reviews"))
@@ -580,7 +691,7 @@ def _live_data(ai_ok: bool) -> None:
 
     analyze = st.checkbox("Analyze new reviews after each poll", value=ai_ok)
     if analyze and not ai_ok:
-        st.warning("OPENROUTER_API_KEY is missing. Collection will run; analysis will be skipped.")
+        st.warning("OpenRouter API key is not configured. Collection will run; analysis will be skipped.")
         analyze = False
     st.session_state["analyze_on_collect"] = analyze
 
@@ -626,9 +737,10 @@ def _live_data(ai_ok: bool) -> None:
         _run_collect(["google_play"], analyze=analyze, mode="latest")
     if apple_only:
         _run_collect(["apple_app_store"], analyze=analyze, mode="latest")
-    if st.button("Analyze pending Myntra-valid reviews"):
-        if not ai_ok:
-            st.error("OPENROUTER_API_KEY is not set in Streamlit Secrets or .env.")
+    if st.button("Analyze Pending Reviews"):
+        reload_settings()
+        if not get_settings().has_ai_credentials:
+            st.error("OpenRouter API key is not configured.")
         elif get_review_count() == 0:
             st.info(EMPTY)
         else:
@@ -661,67 +773,78 @@ def _run_full_discovery(ai_ok: bool) -> None:
             gp = engine.run(["google_play"], analyze=False, mode="last_30_days")
             if gp.errors and gp.fetched == 0:
                 steps["play"] = "failed"
-                box.update(label="FAILED", state="error")
                 st.error("Google Play collection failed: " + "; ".join(gp.errors))
-                st.session_state["pipeline_steps"] = steps
-                return
-            steps["play"] = "done"
-            box.write(f"STEP 1 — Collecting Google Play ✓  fetched {gp.fetched}, new {gp.new}")
+            else:
+                steps["play"] = "done"
+                box.write(f"STEP 1 — Collecting Google Play ✓  fetched {gp.fetched}, new {gp.new}")
 
             box.write("STEP 2 — Collecting Apple App Store")
             steps["apple"] = "running"
             apple = engine.run(["apple_app_store"], analyze=False, mode="last_30_days")
             if apple.errors and apple.fetched == 0:
                 steps["apple"] = "failed"
-                box.update(label="FAILED", state="error")
                 st.error("Apple App Store collection failed: " + "; ".join(apple.errors))
-                st.session_state["pipeline_steps"] = steps
-                return
-            steps["apple"] = "done"
-            region = (apple.by_source.get("apple_app_store") or {}).get("region_used") or "—"
-            box.write(
-                f"STEP 2 — Collecting Apple App Store ✓  region={region} "
-                f"fetched {apple.fetched}, new {apple.new}"
-            )
+            else:
+                steps["apple"] = "done"
+                region = (apple.by_source.get("apple_app_store") or {}).get("region_used") or "—"
+                box.write(
+                    f"STEP 2 — Collecting Apple App Store ✓  region={region} "
+                    f"fetched {apple.fetched}, new {apple.new}"
+                )
 
             box.write("STEP 3 — Saving reviews ✓")
             steps["save"] = "done"
 
             box.write("STEP 4 — Analyzing reviews")
             steps["analyze"] = "running"
-            if not ai_ok or not settings.has_ai_credentials:
+            from app.pipeline.analysis import AnalysisRunResult
+
+            result = AnalysisRunResult()
+            if not get_settings().has_ai_credentials:
                 steps["analyze"] = "failed"
-                box.update(label="FAILED", state="error")
-                st.error(
-                    "AI analysis failed: OPENROUTER_API_KEY is not set in Streamlit Secrets or .env."
-                )
-                st.session_state["pipeline_steps"] = steps
-                st.session_state["last_analysis"] = {
-                    "status": "Failed",
-                    "message": "AI analysis failed: OPENROUTER_API_KEY is not set.",
-                }
-                return
-            try:
-                analyzed = run_analysis_pipeline(
-                    db, analyze_limit=settings.ai_analysis_batch_size
-                )
-            except Exception as exc:
+                msg = "OpenRouter API key is not configured."
+                st.error(msg)
+                result.last_error = msg
+                st.session_state["last_analysis"] = {"status": "Failed", "message": msg}
+            else:
+                try:
+                    result = run_analysis_pipeline(
+                        db, analyze_limit=settings.ai_analysis_batch_size
+                    )
+                except Exception as exc:
+                    steps["analyze"] = "failed"
+                    st.error(f"AI analysis failed: {exc}")
+                    result = AnalysisRunResult(failed=1, last_error=str(exc))
+                    st.session_state["last_analysis"] = {"status": "Failed", "message": str(exc)}
+            if result.analyzed == 0 and (result.failed or result.last_error):
                 steps["analyze"] = "failed"
-                box.update(label="FAILED", state="error")
-                st.error(f"AI analysis failed: {exc}")
-                st.session_state["pipeline_steps"] = steps
-                st.session_state["last_analysis"] = {"status": "Failed", "message": str(exc)}
-                return
-            steps["analyze"] = "done"
-            box.write(f"STEP 4 — Analyzing reviews ✓  analyzed {analyzed}")
-            box.write("STEP 5 — Generating discovery insights ✓")
-            steps["insights"] = "done"
+                box.write(
+                    f"STEP 4 — Analyzing reviews FAILED  analyzed {result.analyzed}, "
+                    f"failed {result.failed}. {result.last_error}"
+                )
+            else:
+                steps["analyze"] = "done"
+                box.write(
+                    f"STEP 4 — Analyzing reviews ✓  analyzed {result.analyzed}, failed {result.failed}"
+                )
+            if result.analyzed:
+                box.write("STEP 5 — Generating discovery insights ✓")
+                steps["insights"] = "done"
+            else:
+                steps["insights"] = "failed" if result.failed or result.last_error else "done"
+                box.write("STEP 5 — Generating discovery insights  (waiting for successful analysis)")
             box.write("STEP 6 — Updating dashboard ✓")
             steps["dashboard"] = "done"
-            box.update(label="Discovery pipeline complete", state="complete")
+            if result.analyzed:
+                box.update(label="Discovery pipeline complete", state="complete")
+            else:
+                box.update(label="Collection saved — analysis needs OpenRouter (see Live Data)", state="error")
             st.session_state["last_analysis"] = {
-                "status": "Connected" if analyzed else "Configured",
-                "message": f"Analyzed {analyzed} reviews. Themes, segments, and opportunity scores were rebuilt.",
+                "status": "Connected" if result.analyzed else ("Failed" if result.failed or result.last_error else "Configured"),
+                "message": (
+                    f"Analyzed {result.analyzed} reviews, failed {result.failed}. "
+                    + (result.last_error or "Themes, segments, and opportunity scores were rebuilt.")
+                ),
             }
             st.session_state["pipeline_steps"] = steps
     except Exception as exc:
@@ -781,14 +904,15 @@ def _run_collect(sources: list[str], analyze: bool, mode: str = "latest") -> Non
             "stats": payload,
         }
         if analyze:
-            if stats.analysis_error:
+            if stats.analysis_error and stats.analyzed == 0:
                 st.session_state["last_analysis"] = {"status": "Failed", "message": stats.analysis_error}
             else:
                 st.session_state["last_analysis"] = {
                     "status": "Connected" if stats.analyzed else "Skipped",
                     "message": (
-                        f"Analyzed {stats.analyzed} reviews. "
-                        f"{stats.pending_remaining} still pending."
+                        f"Analyzed {stats.analyzed} reviews"
+                        + (f", failed {stats.analysis_failed}" if stats.analysis_failed else "")
+                        + f". {stats.pending_remaining} still pending."
                     ),
                 }
     except Exception as exc:
@@ -904,13 +1028,26 @@ def _run_analyze() -> None:
     reload_settings()
     db = _db()
     try:
+        if not get_settings().has_ai_credentials:
+            st.error("OpenRouter API key is not configured.")
+            st.session_state["last_analysis"] = {
+                "status": "Failed",
+                "message": "OpenRouter API key is not configured.",
+            }
+            return
         with st.spinner("Analyzing stored Myntra-valid reviews…"):
-            analyzed = run_analysis_pipeline(db, analyze_limit=get_settings().ai_analysis_batch_size)
+            result = run_analysis_pipeline(db, analyze_limit=get_settings().ai_analysis_batch_size)
         if get_review_count(db) == 0:
             st.session_state["last_analysis"] = {"status": "Failed", "message": EMPTY}
             st.info(EMPTY)
             return
-        if analyzed == 0:
+        if result.analyzed == 0 and result.failed:
+            st.session_state["last_analysis"] = {
+                "status": "Failed",
+                "message": result.last_error or f"AI analysis failed for {result.failed} reviews.",
+            }
+            st.error(result.last_error or f"AI analysis failed for {result.failed} reviews.")
+        elif result.analyzed == 0:
             st.session_state["last_analysis"] = {
                 "status": "Configured",
                 "message": "No new Myntra-valid reviews needed analysis (already analyzed).",
@@ -918,7 +1055,11 @@ def _run_analyze() -> None:
         else:
             st.session_state["last_analysis"] = {
                 "status": "Connected",
-                "message": f"Analyzed {analyzed} reviews. Themes, segments, and opportunity scores were rebuilt.",
+                "message": (
+                    f"Analyzed {result.analyzed} reviews"
+                    + (f", failed {result.failed}" if result.failed else "")
+                    + ". Themes, segments, and opportunity scores were rebuilt."
+                ),
             }
     except Exception as exc:
         LOGGER.exception("Analysis failed")
@@ -997,6 +1138,7 @@ def _labels(field: str, myntra_only: bool, title: str) -> None:
             pending=diag.get("pending_reviews") or 0,
             failed=diag.get("failed_reviews") or 0,
             ai_ok=ai_ok,
+            last_error=str(diag.get("last_analysis_error") or ""),
         )
         if msg:
             (st.info if msg == EMPTY else st.warning)(msg)
@@ -1071,6 +1213,7 @@ def _root_causes(myntra_only: bool = True) -> None:
             pending=diag.get("pending_reviews") or 0,
             failed=diag.get("failed_reviews") or 0,
             ai_ok=ai_ok,
+            last_error=str(diag.get("last_analysis_error") or ""),
         )
         if msg:
             (st.info if msg == EMPTY else st.warning)(msg)
@@ -1134,6 +1277,7 @@ def _opportunities() -> None:
             pending=diag.get("pending_reviews") or 0,
             failed=diag.get("failed_reviews") or 0,
             ai_ok=ai_ok,
+            last_error=str(diag.get("last_analysis_error") or ""),
         )
         if msg:
             (st.info if msg == EMPTY else st.warning)(msg)
@@ -1191,6 +1335,7 @@ def _named(model, title: str) -> None:
             pending=diag.get("pending_reviews") or 0,
             failed=diag.get("failed_reviews") or 0,
             ai_ok=get_settings().has_ai_credentials,
+            last_error=str(diag.get("last_analysis_error") or ""),
         )
         if msg:
             (st.info if msg == EMPTY else st.warning)(msg)
@@ -1241,6 +1386,7 @@ def _evidence() -> None:
                 pending=diag.get("pending_reviews") or 0,
                 failed=diag.get("failed_reviews") or 0,
                 ai_ok=get_settings().has_ai_credentials,
+                last_error=str(diag.get("last_analysis_error") or ""),
             )
             if msg:
                 (st.info if msg == EMPTY else st.warning)(msg)
@@ -1297,6 +1443,7 @@ def _report() -> None:
             pending=diag.get("pending_reviews") or 0,
             failed=diag.get("failed_reviews") or 0,
             ai_ok=get_settings().has_ai_credentials,
+            last_error=str(diag.get("last_analysis_error") or ""),
         )
         if msg:
             (st.info if msg == EMPTY else st.warning)(msg)

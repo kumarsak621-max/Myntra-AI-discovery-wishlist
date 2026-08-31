@@ -86,6 +86,11 @@ def migrate_schema() -> None:
             "analysis_version",
             "ALTER TABLE analysis ADD COLUMN analysis_version VARCHAR(32) DEFAULT '1'",
         ),
+        ("analysis", "http_status", "ALTER TABLE analysis ADD COLUMN http_status INTEGER DEFAULT 0"),
+    ]
+    indexes = [
+        "CREATE INDEX IF NOT EXISTS ix_reviews_review_date ON reviews(review_date)",
+        "CREATE INDEX IF NOT EXISTS ix_analysis_status ON analysis(status)",
     ]
     with engine.begin() as conn:
         for table, column, ddl in statements:
@@ -93,6 +98,8 @@ def migrate_schema() -> None:
             names = {row[1] for row in rows}
             if column not in names:
                 conn.execute(text(ddl))
+        for ddl in indexes:
+            conn.execute(text(ddl))
 
 
 def quarantine_non_myntra_records() -> int:
@@ -158,6 +165,7 @@ def ensure_pending_analysis_rows() -> int:
 
 def get_database_diagnostics(db: Session | None = None) -> dict[str, Any]:
     """Counts for collection vs analysis. Uses review timestamps for the 30-day window."""
+    from app.ai.provider import redact_secrets
     from app.models import Analysis, Opportunity, Review, Segment, Theme
     from app.pipeline.dates import get_last_30_days_cutoff
     from config.settings import OFFICIAL_APPLE_APP_ID, OFFICIAL_GOOGLE_PLAY_APP_ID, official_ids
@@ -233,6 +241,37 @@ def get_database_diagnostics(db: Session | None = None) -> dict[str, Any]:
             )
             .count()
         )
+        last_ok = (
+            session.query(Analysis.analyzed_at)
+            .join(Review)
+            .filter(
+                Analysis.status == "analyzed",
+                Analysis.is_valid_json.is_(True),
+                Review.is_valid_source.is_(True),
+                Review.app_id.in_(myntra_ids),
+            )
+            .order_by(Analysis.analyzed_at.desc())
+            .limit(1)
+            .scalar()
+        )
+        last_fail_row = (
+            session.query(Analysis.parse_error)
+            .join(Review)
+            .filter(
+                Analysis.status == "failed",
+                Review.is_valid_source.is_(True),
+                Review.app_id.in_(myntra_ids),
+                Analysis.parse_error != "",
+            )
+            .order_by(Analysis.analyzed_at.desc())
+            .limit(1)
+            .first()
+        )
+        last_error = ""
+        if last_fail_row and last_fail_row[0]:
+            last_error = redact_secrets(str(last_fail_row[0]))
+        settings = get_settings()
+        provider = settings.ai_provider.lower()
         path = sqlite_path()
         return {
             "database_path": str(path) if path else "",
@@ -240,6 +279,7 @@ def get_database_diagnostics(db: Session | None = None) -> dict[str, Any]:
             "myntra_reviews": myntra_q.count(),
             "google_play_reviews": gp,
             "apple_reviews": apple,
+            "apple_app_store_reviews": apple,
             "last_30_day_reviews": window_q.count(),
             "pending_reviews": pending + no_row,
             "analyzed_reviews": analyzed,
@@ -247,6 +287,74 @@ def get_database_diagnostics(db: Session | None = None) -> dict[str, Any]:
             "themes": session.query(Theme).count(),
             "segments": session.query(Segment).count(),
             "opportunities": session.query(Opportunity).count(),
+            "ai_provider": "OpenRouter" if provider == "openrouter" else settings.ai_provider,
+            "ai_model": settings.resolved_model,
+            "last_successful_analysis_at": last_ok.isoformat() if last_ok else None,
+            "last_analysis_error": last_error or None,
+        }
+    finally:
+        if owns:
+            session.close()
+
+
+def get_ai_diagnostics(db: Session | None = None) -> dict[str, Any]:
+    """Safe AI diagnostics for Live Data. Never includes the API key."""
+    from app.ai.provider import redact_secrets
+    from app.models import Analysis, Review
+    from config.settings import official_ids
+
+    settings = get_settings()
+    base = get_database_diagnostics(db)
+    owns = db is None
+    session = db or SessionLocal()
+    try:
+        myntra_ids = list(official_ids())
+        last_fail_at = (
+            session.query(Analysis.analyzed_at)
+            .join(Review)
+            .filter(
+                Analysis.status == "failed",
+                Review.is_valid_source.is_(True),
+                Review.app_id.in_(myntra_ids),
+            )
+            .order_by(Analysis.analyzed_at.desc())
+            .limit(1)
+            .scalar()
+        )
+        last_http_row = (
+            session.query(Analysis.http_status, Analysis.parse_error)
+            .join(Review)
+            .filter(
+                Review.is_valid_source.is_(True),
+                Review.app_id.in_(myntra_ids),
+                Analysis.http_status > 0,
+            )
+            .order_by(Analysis.analyzed_at.desc())
+            .limit(1)
+            .first()
+        )
+        last_http = int(last_http_row[0]) if last_http_row and last_http_row[0] else None
+        last_error = base.get("last_analysis_error")
+        if last_http_row and last_http_row[1] and not last_error:
+            last_error = redact_secrets(str(last_http_row[1]))
+        provider = (settings.ai_provider or "openrouter").lower()
+        model = (settings.openrouter_model or settings.ai_model or "google/gemini-2.5-flash").strip()
+        if provider == "openrouter":
+            model = (settings.openrouter_model or settings.ai_model or "google/gemini-2.5-flash").strip()
+        return {
+            "ai_provider": "OpenRouter" if provider == "openrouter" else settings.ai_provider,
+            "ai_model": model,
+            "api_key_configured": "YES" if settings.has_ai_credentials else "NO",
+            "pending_reviews": base.get("pending_reviews") or 0,
+            "analyzed_reviews": base.get("analyzed_reviews") or 0,
+            "failed_reviews": base.get("failed_reviews") or 0,
+            "last_successful_analysis": base.get("last_successful_analysis_at"),
+            "last_failed_analysis": last_fail_at.isoformat() if last_fail_at else None,
+            "last_error": last_error or None,
+            "last_http_status": last_http,
+            "myntra_reviews": base.get("myntra_reviews") or 0,
+            "total_reviews": base.get("total_reviews") or 0,
+            "last_30_day_reviews": base.get("last_30_day_reviews") or 0,
         }
     finally:
         if owns:

@@ -18,7 +18,7 @@ from app.schemas import (
 FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 
 
-def extract_json_object(text: str) -> dict[str, Any]:
+def extract_json_value(text: str) -> Any:
     if not text or not str(text).strip():
         raise ValueError("Empty AI response")
     raw = str(text).strip()
@@ -27,18 +27,63 @@ def extract_json_object(text: str) -> dict[str, Any]:
         raw = fenced.group(1).strip()
     try:
         payload = json.loads(raw)
-        if isinstance(payload, dict):
+        if isinstance(payload, (dict, list)):
             return payload
-        raise ValueError("AI JSON root is not an object")
+        raise ValueError("AI JSON root is not an object or array")
     except json.JSONDecodeError:
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start == -1 or end == -1 or end <= start:
+        snippets: list[tuple[int, str]] = []
+        start_obj, end_obj = raw.find("{"), raw.rfind("}")
+        start_arr, end_arr = raw.find("["), raw.rfind("]")
+        if start_obj != -1 and end_obj > start_obj:
+            snippets.append((start_obj, raw[start_obj : end_obj + 1]))
+        if start_arr != -1 and end_arr > start_arr:
+            snippets.append((start_arr, raw[start_arr : end_arr + 1]))
+        if not snippets:
             raise ValueError("No JSON object found in AI response") from None
-        payload = json.loads(raw[start : end + 1])
-        if not isinstance(payload, dict):
-            raise ValueError("AI JSON root is not an object")
-        return payload
+        snippets.sort()
+        last_err: Exception | None = None
+        for _, snippet in snippets:
+            try:
+                payload = json.loads(snippet)
+            except json.JSONDecodeError as exc:
+                last_err = exc
+                continue
+            if isinstance(payload, (dict, list)):
+                return payload
+        raise ValueError("No JSON object found in AI response") from last_err
+
+
+def extract_json_object(text: str) -> dict[str, Any]:
+    payload = extract_json_value(text)
+    if not isinstance(payload, dict):
+        raise ValueError("AI JSON root is not an object")
+    return payload
+
+
+def parse_batch_payload(raw_response: str) -> tuple[list[dict[str, Any]], str]:
+    """Return analysis objects from a batch or single-review AI response."""
+    try:
+        value = extract_json_value(raw_response)
+    except (ValueError, json.JSONDecodeError) as exc:
+        return [], f"Malformed AI JSON: {exc}"
+
+    items: list[Any]
+    if isinstance(value, list):
+        items = value
+    elif isinstance(value, dict):
+        if isinstance(value.get("results"), list):
+            items = value["results"]
+        elif "relevance" in value or "id" in value:
+            items = [value]
+        else:
+            return [], "Malformed AI JSON: missing results[] array"
+    else:
+        return [], "Malformed AI JSON: root is not an object or array"
+
+    objects = [item for item in items if isinstance(item, dict)]
+    if not objects:
+        return [], "Malformed AI JSON: results[] contained no objects"
+    return objects, ""
 
 
 def _quote_in_source(quote: str, source_text: str) -> bool:
@@ -90,9 +135,24 @@ def validate_analysis_payload(payload: dict[str, Any], original_text: str) -> Re
     return sanitize_quotes(parsed, original_text)
 
 
+def try_validate_payload(
+    payload: dict[str, Any], original_text: str
+) -> tuple[ReviewAnalysisSchema | None, str]:
+    cleaned = {key: value for key, value in payload.items() if key not in {"id", "source_review_id"}}
+    if cleaned.get("user_problem") and not cleaned.get("root_cause"):
+        cleaned["root_cause"] = {"statement": str(cleaned.get("user_problem") or "")}
+    barrier = cleaned.get("purchase_barrier")
+    if barrier and not cleaned.get("barriers"):
+        cleaned["barriers"] = barrier if isinstance(barrier, list) else [str(barrier)]
+    try:
+        return validate_analysis_payload(cleaned, original_text), ""
+    except (ValueError, ValidationError, json.JSONDecodeError, TypeError) as exc:
+        return None, f"AI response failed schema validation: {exc}"
+
+
 def try_validate_analysis(raw_response: str, original_text: str) -> tuple[ReviewAnalysisSchema | None, str]:
     try:
         payload = extract_json_object(raw_response)
-        return validate_analysis_payload(payload, original_text), ""
-    except (ValueError, ValidationError, json.JSONDecodeError) as exc:
-        return None, str(exc)
+        return try_validate_payload(payload, original_text)
+    except (ValueError, json.JSONDecodeError) as exc:
+        return None, f"Malformed AI JSON: {exc}"

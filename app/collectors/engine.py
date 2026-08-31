@@ -179,7 +179,6 @@ class CollectionEngine:
                         }
                     )
 
-            analyzed = 0
             if analyze:
                 if progress:
                     progress({"stage": "analysis", "status": "start"})
@@ -192,13 +191,13 @@ class CollectionEngine:
                     else self.settings.ai_analysis_batch_size
                 )
                 try:
-                    analyzed = run_analysis_pipeline(self.db, progress=progress, analyze_limit=limit)
-                    combined.analyzed = analyzed
-                    if analyzed == 0 and self.settings.has_ai_credentials:
-                        from app.pipeline.analysis import reviews_needing_analysis
-
-                        leftover = len(reviews_needing_analysis(self.db))
-                        combined.pending_remaining = leftover
+                    result = run_analysis_pipeline(self.db, progress=progress, analyze_limit=limit)
+                    combined.analyzed = result.analyzed
+                    combined.analysis_failed = result.failed
+                    if result.last_error:
+                        combined.analysis_error = result.last_error
+                    if result.failed and result.analyzed == 0:
+                        combined.errors.append(result.last_error)
                 except AIError as exc:
                     msg = str(exc)
                     logger.error(msg)
@@ -209,9 +208,9 @@ class CollectionEngine:
                     logger.exception(msg)
                     combined.errors.append(msg)
                     combined.analysis_error = msg
-            from app.pipeline.analysis import reviews_needing_analysis
+            from app.database import get_database_diagnostics
 
-            combined.pending_remaining = len(reviews_needing_analysis(self.db))
+            combined.pending_remaining = int(get_database_diagnostics(self.db).get("pending_reviews") or 0)
 
             combined.source_validations = validations
             combined.duration_seconds = round(time.monotonic() - started, 2)
