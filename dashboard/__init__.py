@@ -1,1 +1,5 @@
-Dashboard static files are served from app/static by the FastAPI app launched via python app.py.
+"""Dashboards.
+
+- Streamlit Cloud / `streamlit run app.py` → `dashboard.streamlit_app`
+- Local FastAPI / `python app.py` → static files in `app/static`
+"""

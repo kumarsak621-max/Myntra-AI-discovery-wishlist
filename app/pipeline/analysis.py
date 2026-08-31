@@ -133,7 +133,7 @@ def analyze_new_reviews(
     if not provider.available():
         message = (
             "AI credentials are not configured. Reviews are stored but not analyzed. "
-            "Set OPENROUTER_API_KEY in .env."
+            "Set OPENROUTER_API_KEY in Streamlit Secrets or .env."
         )
         logger.warning(message)
         if progress:

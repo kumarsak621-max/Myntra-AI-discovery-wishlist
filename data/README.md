@@ -4,6 +4,8 @@ Collected reviews live in the local SQLite file `myntra_discovery.db` at the pro
 
 That database is **not** committed. It can contain public review text and should be rebuilt on each machine.
 
+On Streamlit Cloud the filesystem is ephemeral. SQLite works for a running session but is not permanent production storage.
+
 ## How to collect
 
 1. Copy `.env.example` to `.env`.

@@ -93,9 +93,36 @@ class Settings(BaseSettings):
         )
 
 
+def _streamlit_secret(name: str) -> str | None:
+    """Read a secret from Streamlit Cloud when running inside Streamlit."""
+    try:
+        import streamlit as st
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+        if get_script_run_ctx() is None:
+            return None
+        if name not in st.secrets:
+            return None
+        value = st.secrets.get(name)
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+    except Exception:
+        return None
+
+
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    settings = Settings()
+    secret_key = _streamlit_secret("OPENROUTER_API_KEY")
+    secret_model = _streamlit_secret("OPENROUTER_MODEL")
+    if secret_key:
+        settings.openrouter_api_key = secret_key
+    if secret_model:
+        settings.openrouter_model = secret_model
+        settings.ai_model = secret_model
+    return settings
 
 
 def reload_settings() -> Settings:

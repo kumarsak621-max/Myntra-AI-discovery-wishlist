@@ -23,7 +23,7 @@ Public sources
     → dashboard + discovery report
 ```
 
-`python app.py` is the entry point. It loads `.env`, validates official Myntra app identities, initializes SQLite, collectors, the AI provider, and the dashboard.
+`python app.py` starts the FastAPI dashboard. `streamlit run app.py` starts the Streamlit dashboard used on Streamlit Cloud. Both reuse the same collectors, validation, analysis, and SQLite store.
 
 ## Data Sources
 
@@ -94,11 +94,23 @@ Collection still works without an AI key. Analysis is skipped until `OPENROUTER_
 
 ## Run
 
+Local FastAPI dashboard:
+
 ```bash
 python app.py
 ```
 
 Then open http://127.0.0.1:8000
+
+Local Streamlit dashboard (same entry file Streamlit Cloud uses):
+
+```bash
+streamlit run app.py
+```
+
+Then open http://127.0.0.1:8501
+
+Main file for Streamlit Cloud: `app.py`
 
 ## Data Collection
 
@@ -106,13 +118,18 @@ On **Data Collection**:
 
 - **Collect Google Play Reviews** — live Play Store reviews for `com.myntra.android`
 - **Collect Apple App Store Reviews** — iTunes RSS for `907394059` (India first)
-- **Collect All** — both sources, then the analysis pipeline for new Myntra-valid reviews
+- **Collect All** — both sources
+- **Analyze stored Myntra-valid reviews** — OpenRouter JSON analysis for new or changed reviews only
 
 Raw reviews are stored in local SQLite (`myntra_discovery.db`), which is gitignored. Collect after clone; do not commit the database.
 
+On Streamlit Cloud the filesystem is **ephemeral**. SQLite is available for the running session/demo and is wiped on reboot or redeploy. This app does not provide permanent cloud persistence.
+
 ## AI Analysis
 
-OpenRouter is the default gateway (`AI_PROVIDER=openrouter`). The model is set with `OPENROUTER_MODEL` / `AI_MODEL`.
+OpenRouter is the default gateway (`AI_PROVIDER=openrouter`). The model is set with `OPENROUTER_MODEL` / `AI_MODEL` (default `google/gemini-2.5-flash`).
+
+Locally the key comes from `.env`. On Streamlit Cloud it comes from Secrets. The API key is never shown in the UI or printed in logs.
 
 The LLM extracts structured JSON: relevance, wishlist/purchase signals, intents, barriers, uncertainties, information-seeking, behavioral signals, and observed / inferred / hypothesized root causes.
 
@@ -124,13 +141,44 @@ score = reach × frequency × purchase_impact × severity × evidence_confidence
 
 Each dimension is 1–5.
 
+Analysis is cached by review content hash. Unchanged reviews are not sent to the model again.
+
 ## Dashboard
 
-The dashboard includes Overview, Data Collection, Feedback Explorer, Wishlist Motivations, Purchase Barriers, Uncertainties, Root Causes, Themes, Segments, External Information Seeking, Opportunity Matrix, Evidence Explorer, and Discovery Report.
+The dashboard includes Overview, Data Collection, Feedback Explorer, Wishlist Motivations, Purchase Barriers, Uncertainties, Root Causes, Themes, User Segments, Opportunity Matrix, Evidence Explorer, and Discovery Report.
+
+If nothing has been collected yet, the UI shows:
+
+`No data collected yet. Run the data collection pipeline.`
 
 Every insight opens the original review text, source, URL, review ID, date, and classification. Quotes are never generated.
 
 Default filter: **Myntra-valid evidence only**.
+
+## Deploy to Streamlit Cloud
+
+1. Open [Streamlit Community Cloud](https://share.streamlit.io/).
+2. Connect GitHub.
+3. Select repository: `kumarsak621-max/Myntra-AI-discovery-wishlist`
+4. Select branch: `main`
+5. Select the Streamlit main file: `app.py`
+6. Add Streamlit Secrets (App settings → Secrets) in TOML:
+
+```toml
+OPENROUTER_API_KEY = "YOUR_OPENROUTER_API_KEY"
+OPENROUTER_MODEL = "google/gemini-2.5-flash"
+```
+
+7. Deploy.
+
+Official source IDs used by the app (do not change them):
+
+- Google Play: `com.myntra.android`
+- Apple App Store: `907394059` (India first, US fallback)
+
+Do not put a real API key in this README. Do not commit `.env` or `.streamlit/secrets.toml`.
+
+Python version: 3.12 (`runtime.txt`).
 
 ## Tests
 
@@ -144,3 +192,9 @@ pytest -q
 - Author names are not shown in the UI
 - Only publicly available store reviews are collected
 - Original review text is never overwritten
+
+## Known limitations
+
+- Streamlit Cloud disk is ephemeral; SQLite does not persist across restarts or redeploys.
+- Google Play collection can fail from some cloud IPs if the Play Store blocks the scraper. Apple iTunes RSS is usually more reliable from cloud hosts.
+- Keep “max reviews per source” small on Streamlit Cloud to stay within request time limits.

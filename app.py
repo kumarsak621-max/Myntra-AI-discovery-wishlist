@@ -1,8 +1,13 @@
 """
 Myntra AI Discovery Engine — main entry point.
 
-Run:
+Local FastAPI dashboard:
     python app.py
+    http://127.0.0.1:8000
+
+Streamlit (local or Streamlit Cloud):
+    streamlit run app.py
+    http://127.0.0.1:8501
 """
 
 from __future__ import annotations
@@ -180,5 +185,19 @@ def main() -> None:
         sys.exit(1)
 
 
-if __name__ == "__main__":
+def running_in_streamlit() -> bool:
+    """True when this file is executed by `streamlit run`."""
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+        return get_script_run_ctx() is not None
+    except Exception:
+        return False
+
+
+if running_in_streamlit():
+    from dashboard.streamlit_app import render
+
+    render()
+elif __name__ == "__main__":
     main()

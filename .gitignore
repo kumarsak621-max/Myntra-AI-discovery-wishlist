@@ -40,3 +40,5 @@ credentials/
 
 .idea/
 .vscode/
+
+.streamlit/secrets.toml
