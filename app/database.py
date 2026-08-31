@@ -271,7 +271,6 @@ def get_database_diagnostics(db: Session | None = None) -> dict[str, Any]:
         if last_fail_row and last_fail_row[0]:
             last_error = redact_secrets(str(last_fail_row[0]))
         settings = get_settings()
-        provider = settings.ai_provider.lower()
         path = sqlite_path()
         return {
             "database_path": str(path) if path else "",
@@ -287,7 +286,7 @@ def get_database_diagnostics(db: Session | None = None) -> dict[str, Any]:
             "themes": session.query(Theme).count(),
             "segments": session.query(Segment).count(),
             "opportunities": session.query(Opportunity).count(),
-            "ai_provider": "OpenRouter" if provider == "openrouter" else settings.ai_provider,
+            "ai_provider": "Google Gemini",
             "ai_model": settings.resolved_model,
             "last_successful_analysis_at": last_ok.isoformat() if last_ok else None,
             "last_analysis_error": last_error or None,
@@ -337,13 +336,9 @@ def get_ai_diagnostics(db: Session | None = None) -> dict[str, Any]:
         last_error = base.get("last_analysis_error")
         if last_http_row and last_http_row[1] and not last_error:
             last_error = redact_secrets(str(last_http_row[1]))
-        provider = (settings.ai_provider or "openrouter").lower()
-        model = (settings.openrouter_model or settings.ai_model or "google/gemini-2.5-flash").strip()
-        if provider == "openrouter":
-            model = (settings.openrouter_model or settings.ai_model or "google/gemini-2.5-flash").strip()
         return {
-            "ai_provider": "OpenRouter" if provider == "openrouter" else settings.ai_provider,
-            "ai_model": model,
+            "ai_provider": "Google Gemini",
+            "ai_model": settings.resolved_model,
             "api_key_configured": "YES" if settings.has_ai_credentials else "NO",
             "pending_reviews": base.get("pending_reviews") or 0,
             "analyzed_reviews": base.get("analyzed_reviews") or 0,

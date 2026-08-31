@@ -83,14 +83,22 @@ cp .env.example .env
 Open `.env` and set:
 
 ```
-OPENROUTER_API_KEY=your_key_here
+GEMINI_API_KEY=your_key_here
+GEMINI_MODEL=gemini-2.5-flash
 ```
 
 Leave `GOOGLE_PLAY_APP_ID=com.myntra.android` and `APPLE_APP_ID=907394059`.
 
-Never put a real API key in this README. Never commit `.env`.
+Never put a real API key in this README. Never commit `.env` or `.streamlit/secrets.toml`.
 
-Collection still works without an AI key. Analysis is skipped until `OPENROUTER_API_KEY` is set.
+Collection still works without an AI key. Analysis is skipped until `GEMINI_API_KEY` is set. If the key is missing, the app shows `Gemini API key is not configured.` — not a fake empty corpus.
+
+**Configuration priority**
+
+1. Streamlit Cloud: when the app runs inside Streamlit, `st.secrets` (`GEMINI_API_KEY`, `GEMINI_MODEL`) overlay local `.env` values.
+2. Local development: pydantic-settings loads `.env`.
+
+Never hard-code the key. Never print it. Never show it in the UI.
 
 ## Run
 
@@ -134,11 +142,19 @@ The dashboard shows **Storage: Local application storage**. On Streamlit Cloud t
 
 ## AI Analysis
 
-OpenRouter is the default gateway (`AI_PROVIDER=openrouter`). The model is set with `OPENROUTER_MODEL` / `AI_MODEL` (default `google/gemini-2.5-flash`).
+**AI Provider:** Google Gemini (official Gemini API, not OpenRouter)
 
-Locally the key comes from `.env`. On Streamlit Cloud it comes from Secrets. The API key is never shown in the UI or printed in logs.
+**Model:** `gemini-2.5-flash` (override with `GEMINI_MODEL`)
 
-The LLM extracts structured JSON: relevance, wishlist/purchase signals, intents, barriers, uncertainties, information-seeking, behavioral signals, and observed / inferred / hypothesized root causes.
+**Required secret:** `GEMINI_API_KEY`
+
+**Optional/configured model:** `GEMINI_MODEL` (default `gemini-2.5-flash`)
+
+Locally the key and model come from `.env`. On Streamlit Cloud they come from **App settings → Secrets**. When Streamlit is running, `st.secrets` overlays `.env` values. The API key is never shown in the UI or printed in logs.
+
+Gemini API usage is subject to Google's applicable quota and rate limits. If those are hit, the app reports: `Gemini API quota/rate limit reached. Please try again later.`
+
+The LLM extracts structured JSON: relevance, wishlist/purchase signals, intents, barriers, uncertainties, information-seeking, behavioral signals, and observed / inferred / hypothesized root causes. It analyzes only the supplied review text. It must not invent quotes or assume every review is about wishlist behavior.
 
 Python (not the LLM) calculates counts, percentages, clustering inputs, and opportunity scores:
 
@@ -148,11 +164,11 @@ score = reach × frequency × purchase_impact × severity × evidence_confidence
 
 Each dimension is 1–5.
 
-AI analysis is cached by review content hash. Unchanged `analyzed` reviews are not sent to the model again. New reviews are stored as `pending`. Failed reviews are retried. OpenRouter requests use batches of `AI_REQUEST_BATCH_SIZE` (default **10**). A pipeline run processes up to `AI_ANALYSIS_BATCH_SIZE` (default 60) pending reviews so Streamlit Cloud requests do not time out. Click **Analyze Pending Reviews** or **Run Full Discovery Pipeline** again to continue.
+AI analysis is cached by review content hash. Unchanged `analyzed` reviews are not sent to the model again. New reviews are stored as `pending`. Failed reviews are retried and store the error. Gemini requests use batches of `AI_REQUEST_BATCH_SIZE` (default **10**). A pipeline run processes up to `AI_ANALYSIS_BATCH_SIZE` (default 60) pending reviews so Streamlit Cloud requests do not time out. Click **Analyze Pending Reviews** or **Run Full Discovery Pipeline** again to continue.
 
 If discovery pages are empty, Live Data explains the actual reason (no reviews, pending analysis, missing API key, or a stored analysis error). It never treats stored reviews as “no data collected.”
 
-On **Live Data** use **Test AI Connection** to send a minimal OpenRouter request. Success is reported only when that request succeeds. The API key is shown only as Configured / Missing.
+On **Live Data** use **Test Gemini Connection** to send a minimal Gemini API request. Success is reported only when that request succeeds. The API key is shown only as Configured / Missing.
 
 ## Full discovery
 
@@ -161,7 +177,7 @@ On **Live Data** use **Test AI Connection** to send a minimal OpenRouter request
 1. Collect Google Play last 30 days  
 2. Collect Apple App Store last 30 days (India, then US fallback)  
 3. Normalize, deduplicate, store  
-4. Analyze pending reviews with OpenRouter  
+4. Analyze pending reviews with Google Gemini  
 5. Rebuild themes, segments, and opportunity scores  
 6. Refresh the dashboard  
 
@@ -173,16 +189,17 @@ A failed batch does not mark every pending review as failed.
 python -m utils.diagnostics
 ```
 
-Prints database path and counts, collector status, OpenRouter configuration (never the key), connection test result, and discovery table counts.
+Prints database path and counts, collector status, Gemini configuration (never the key), connection test result, and discovery table counts.
 
 ## Troubleshooting
 
 | Symptom | What it actually means |
 | --- | --- |
 | No reviews have been collected yet. | Database has 0 stored reviews. Click Collect Last 30 Days. |
-| X real reviews are awaiting AI analysis. | Reviews are stored as `pending`. Set `OPENROUTER_API_KEY`, Test AI Connection, then Analyze Pending Reviews. |
-| AI analysis failed for X reviews. | Per-review `failed` rows exist. Open Live Data for `Last error` / HTTP status. Failed rows are retried. |
-| OpenRouter API key is not configured. | Missing from `.env` locally or Streamlit Secrets in the cloud. |
+| X real reviews are awaiting AI analysis. | Reviews are stored as `pending`. Set `GEMINI_API_KEY`, Test Gemini Connection, then Analyze Pending Reviews. |
+| AI analysis failed for X reviews. | Per-review `failed` rows exist. Open Live Data for `Last error`. Failed rows are retried. |
+| Gemini API key is not configured. | Missing from `.env` locally or Streamlit Secrets in the cloud. |
+| Gemini API quota/rate limit reached. | Google Gemini quota or rate limit. Wait and retry later. |
 | Google Play collection failed | The scraper was blocked or the store request failed. The safe error is shown; Apple RSS may still succeed. |
 | Streamlit Cloud empty after reboot | Local SQLite is ephemeral on Cloud. Collect again after restart. |
 
@@ -212,8 +229,8 @@ Default filter: **Myntra-valid evidence only**.
 6. Add Streamlit Secrets (App settings → Secrets) in TOML:
 
 ```toml
-OPENROUTER_API_KEY = "YOUR_OPENROUTER_API_KEY"
-OPENROUTER_MODEL = "google/gemini-2.5-flash"
+GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"
+GEMINI_MODEL = "gemini-2.5-flash"
 ```
 
 7. Deploy.

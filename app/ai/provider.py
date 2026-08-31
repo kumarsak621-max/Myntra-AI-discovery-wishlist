@@ -1,22 +1,22 @@
-"""AI provider gateway. Keys and model names come only from Settings."""
+"""Google Gemini AI gateway. Keys and model names come only from Settings."""
 
 from __future__ import annotations
 
-import json
 import logging
+import re
 import time
 from typing import Any
 
-import httpx
-
 from app.config import Settings, get_settings
+from config.settings import normalize_gemini_model
 
 logger = logging.getLogger(__name__)
 
+QUOTA_MESSAGE = "Gemini API quota/rate limit reached. Please try again later."
+MISSING_KEY_MESSAGE = "Gemini API key is not configured."
+
 
 def _redact(text: str) -> str:
-    import re
-
     cleaned = text or ""
     cleaned = re.sub(r"sk-or-[A-Za-z0-9_-]+", "[redacted]", cleaned)
     cleaned = re.sub(r"Bearer\s+\S+", "Bearer [redacted]", cleaned)
@@ -33,43 +33,31 @@ def _backoff_seconds(attempt: int, retry_after: float | None = None) -> float:
     return min(8.0, max(0.5, wait))
 
 
-def _error_snippet(body: str) -> str:
-    text = _redact((body or "").strip())
-    try:
-        payload = json.loads(text)
-        err = payload.get("error") if isinstance(payload, dict) else None
-        if isinstance(err, dict):
-            message = err.get("message") or err.get("metadata") or err
-            return _redact(str(message))[:400]
-        if isinstance(err, str):
-            return _redact(err)[:400]
-    except json.JSONDecodeError:
-        pass
-    return text[:400]
+def _error_status(exc: BaseException) -> int | None:
+    for attr in ("code", "status_code", "http_status"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    status = getattr(exc, "status", None)
+    if isinstance(status, int):
+        return status
+    return None
 
 
-def _client_http_message(status_code: int, body: str) -> str:
-    snippet = _error_snippet(body)
-    if status_code in {401, 403}:
-        return (
-            "OpenRouter rejected the API key (HTTP "
-            f"{status_code}). OpenRouter API key is not configured correctly."
-        )
-    if status_code == 400:
-        return f"OpenRouter rejected the request (HTTP 400). {snippet}"
-    return f"AI HTTP {status_code}: {snippet}"
-
-
-def _is_json_mode_error(body: str) -> bool:
-    lowered = (body or "").lower()
+def _is_quota_error(message: str, status: int | None) -> bool:
+    if status == 429:
+        return True
+    lowered = (message or "").lower()
     return any(
         token in lowered
         for token in (
-            "json mode",
-            "json_object",
-            "response_format",
-            "not supported",
-            "unsupported",
+            "resource_exhausted",
+            "resource exhausted",
+            "quota",
+            "rate limit",
+            "too many requests",
         )
     )
 
@@ -87,203 +75,101 @@ class AIError(RuntimeError):
         self.http_status = http_status
 
 
-class AIProvider:
+class GeminiAIService:
+    """Production AI path: official Google Gemini API only."""
+
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
 
     @property
     def provider_name(self) -> str:
-        return self.settings.ai_provider.lower()
+        return "gemini"
 
     @property
     def model(self) -> str:
-        return self.settings.resolved_model
+        return normalize_gemini_model(self.settings.resolved_model)
 
     def available(self) -> bool:
-        return self.settings.has_ai_credentials
+        return bool((self.settings.gemini_api_key or "").strip())
+
+    def _client(self):
+        from google import genai
+
+        return genai.Client(api_key=self.settings.gemini_api_key)
 
     def complete_json(self, *, system: str, user: str) -> str:
         if not self.available():
-            raise AIError(
-                "OpenRouter API key is not configured.",
-                http_status=None,
-            )
-        if self.provider_name == "gemini":
-            return self._gemini(system, user)
-        return self._openrouter(system, user)
+            raise AIError(MISSING_KEY_MESSAGE)
+        from google.genai import types
 
-    def _openrouter(self, system: str, user: str) -> str:
-        url = self.settings.openrouter_base_url.rstrip("/") + "/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self.settings.openrouter_api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/kumarsak621-max/Myntra-AI-discovery-wishlist",
-            "X-Title": "Myntra Discovery Engine",
-        }
-        body: dict[str, Any] = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": 0.2,
-        }
-        # Gemini via OpenRouter often rejects OpenAI json_object mode (HTTP 400).
-        model_l = str(self.model).lower()
-        prefer_json_object = not (model_l.startswith("google/") or "gemini" in model_l)
-        return self._post_chat(url, headers, body, prefer_json_object=prefer_json_object)
-
-    def _gemini(self, system: str, user: str) -> str:
-        model = self.model
-        url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{model}:generateContent"
-        )
-        headers = {"x-goog-api-key": self.settings.gemini_api_key, "Content-Type": "application/json"}
-        body = {
-            "systemInstruction": {"parts": [{"text": system}]},
-            "contents": [{"role": "user", "parts": [{"text": user}]}],
-            "generationConfig": {
-                "temperature": 0.2,
-                "responseMimeType": "application/json",
-            },
-        }
         last_error: AIError | None = None
-        attempts = max(1, int(self.settings.ai_retry_attempts))
+        attempts = max(1, int(self.settings.ai_retry_attempts or 5))
         for attempt in range(1, attempts + 1):
             try:
-                with httpx.Client(timeout=90.0) as client:
-                    response = client.post(url, headers=headers, json=body)
-                    if response.status_code == 429 or response.status_code >= 500:
-                        last_error = AIError(
-                            _client_http_message(response.status_code, response.text),
-                            retryable=True,
-                            http_status=response.status_code,
-                        )
-                        time.sleep(_backoff_seconds(attempt))
-                        continue
-                    if 400 <= response.status_code < 500:
-                        raise AIError(
-                            _client_http_message(response.status_code, response.text),
-                            http_status=response.status_code,
-                        )
-                    response.raise_for_status()
-                    data = response.json()
-                    candidates = data.get("candidates") or []
-                    if not candidates:
-                        raise AIError("Gemini returned no candidates.")
-                    parts = (candidates[0].get("content") or {}).get("parts") or []
-                    text = "".join(p.get("text") or "" for p in parts)
-                    if not text:
-                        raise AIError("Gemini returned empty text")
-                    return text
+                response = self._client().models.generate_content(
+                    model=self.model,
+                    contents=user,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system,
+                        temperature=0.2,
+                        response_mime_type="application/json",
+                    ),
+                )
+                text = (getattr(response, "text", None) or "").strip()
+                if not text:
+                    raise AIError("Gemini returned empty content.")
+                return text
             except AIError as exc:
                 if not exc.retryable:
                     raise
                 last_error = exc
                 time.sleep(_backoff_seconds(attempt))
-            except httpx.TimeoutException:
-                last_error = AIError("The AI request timed out. Try fewer reviews, then retry.", retryable=True)
-                time.sleep(_backoff_seconds(attempt))
-            except httpx.HTTPError as exc:
-                last_error = AIError("Network error contacting the AI provider.", retryable=True)
-                logger.warning("AI call failed attempt %s: %s", attempt, _redact(str(exc)))
+            except Exception as exc:
+                mapped = _map_gemini_exception(exc)
+                if not mapped.retryable:
+                    raise mapped
+                last_error = mapped
+                logger.warning("Gemini call failed attempt %s: %s", attempt, mapped)
                 time.sleep(_backoff_seconds(attempt))
         raise last_error or AIError("Gemini request failed")
 
-    def _post_chat(
-        self,
-        url: str,
-        headers: dict[str, str],
-        body: dict[str, Any],
-        *,
-        prefer_json_object: bool,
-    ) -> str:
-        last_error: AIError | None = None
-        json_object_enabled = prefer_json_object
-        attempts = max(1, int(self.settings.ai_retry_attempts))
-        for attempt in range(1, attempts + 1):
-            payload = dict(body)
-            if json_object_enabled:
-                payload["response_format"] = {"type": "json_object"}
-            try:
-                with httpx.Client(timeout=90.0) as client:
-                    response = client.post(url, headers=headers, json=payload)
-                    if response.status_code == 429:
-                        retry_after = None
-                        raw_retry = response.headers.get("Retry-After")
-                        try:
-                            retry_after = float(raw_retry) if raw_retry else None
-                        except (TypeError, ValueError):
-                            retry_after = None
-                        last_error = AIError(
-                            "The AI provider rate-limited this request (HTTP 429). Retrying.",
-                            retryable=True,
-                            http_status=429,
-                        )
-                        time.sleep(_backoff_seconds(attempt, retry_after))
-                        continue
-                    if response.status_code == 400 and json_object_enabled and _is_json_mode_error(response.text):
-                        json_object_enabled = False
-                        last_error = AIError(
-                            _client_http_message(400, response.text),
-                            retryable=True,
-                            http_status=400,
-                        )
-                        logger.warning("JSON response_format rejected; retrying without it.")
-                        continue
-                    if 400 <= response.status_code < 500:
-                        raise AIError(
-                            _client_http_message(response.status_code, response.text),
-                            http_status=response.status_code,
-                        )
-                    if response.status_code >= 500:
-                        last_error = AIError(
-                            f"AI provider error HTTP {response.status_code}. Retrying.",
-                            retryable=True,
-                            http_status=response.status_code,
-                        )
-                        time.sleep(_backoff_seconds(attempt))
-                        continue
-                    try:
-                        data = response.json()
-                    except ValueError as exc:
-                        raise AIError("AI returned a non-JSON HTTP body.") from exc
-                    choices = data.get("choices") or []
-                    if not choices:
-                        raise AIError("AI returned no choices in the response.")
-                    content = (choices[0].get("message") or {}).get("content") or ""
-                    if not content:
-                        raise AIError("AI returned empty content")
-                    return content
-            except AIError as exc:
-                if not exc.retryable:
-                    raise
-                last_error = exc
-                time.sleep(_backoff_seconds(attempt))
-            except httpx.TimeoutException:
-                last_error = AIError(
-                    "The AI request timed out. Try fewer reviews, then retry.",
-                    retryable=True,
-                )
-                logger.warning("AI timeout attempt %s", attempt)
-                time.sleep(_backoff_seconds(attempt))
-            except httpx.HTTPError as exc:
-                last_error = AIError("Network error contacting the AI provider.", retryable=True)
-                logger.warning("AI call failed attempt %s: %s", attempt, _redact(str(exc)))
-                time.sleep(_backoff_seconds(attempt))
-        raise last_error or AIError("AI request failed")
+
+AIProvider = GeminiAIService
 
 
-def test_openrouter_connection(settings: Settings | None = None) -> dict[str, Any]:
-    """Minimal live OpenRouter request. Never logs or returns the API key."""
+def _map_gemini_exception(exc: BaseException) -> AIError:
+    status = _error_status(exc)
+    message = _redact(str(exc) or exc.__class__.__name__)
+    if _is_quota_error(message, status):
+        return AIError(QUOTA_MESSAGE, retryable=True, http_status=status or 429)
+    lowered = message.lower()
+    if status in {401, 403} or "api key" in lowered or "unauthenticated" in lowered or "permission" in lowered:
+        return AIError(
+            "Gemini rejected the API key. Check GEMINI_API_KEY in Streamlit Secrets or .env.",
+            http_status=status or 403,
+        )
+    if status in {500, 502, 503, 504} or "unavailable" in lowered or "internal" in lowered:
+        return AIError(
+            f"Gemini provider error HTTP {status or '5xx'}. Retrying.",
+            retryable=True,
+            http_status=status,
+        )
+    if "timeout" in lowered or "timed out" in lowered or "deadline" in lowered:
+        return AIError("The Gemini request timed out. Try fewer reviews, then retry.", retryable=True)
+    if "connect" in lowered or "network" in lowered:
+        return AIError("Network error contacting Gemini.", retryable=True)
+    return AIError(message[:400], http_status=status)
+
+
+def test_gemini_connection(settings: Settings | None = None) -> dict[str, Any]:
+    """Minimal live Gemini request. Never logs or returns the API key."""
     from config.settings import reload_settings
 
     settings = settings or reload_settings()
-    model = (settings.openrouter_model or settings.ai_model or "google/gemini-2.5-flash").strip()
-    configured = bool((settings.openrouter_api_key or "").strip())
+    model = normalize_gemini_model(settings.gemini_model or settings.resolved_model)
+    configured = bool((settings.gemini_api_key or "").strip())
     result: dict[str, Any] = {
-        "provider": "OpenRouter",
+        "provider": "Google Gemini",
         "model": model,
         "credentials": "Configured" if configured else "Missing",
         "ok": False,
@@ -292,75 +178,40 @@ def test_openrouter_connection(settings: Settings | None = None) -> dict[str, An
         "error": None,
     }
     if not configured:
-        result["error"] = "OpenRouter API key is not configured."
+        result["error"] = MISSING_KEY_MESSAGE
         return result
 
-    url = settings.openrouter_base_url.rstrip("/") + "/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {settings.openrouter_api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/kumarsak621-max/Myntra-AI-discovery-wishlist",
-        "X-Title": "Myntra Discovery Engine",
-    }
-    body: dict[str, Any] = {
-        "model": model,
-        "messages": [{"role": "user", "content": "Reply with the single word ok."}],
-        "temperature": 0,
-        "max_tokens": 8,
-    }
-    last_error = "OpenRouter connection test failed."
-    http_status: int | None = None
+    from google.genai import types
+
     attempts = min(3, max(1, int(settings.ai_retry_attempts or 3)))
+    last_error = "Gemini connection test failed."
     for attempt in range(1, attempts + 1):
         try:
-            with httpx.Client(timeout=30.0) as client:
-                response = client.post(url, headers=headers, json=body)
-            http_status = response.status_code
-            if response.status_code in {429, 500, 502, 503, 504} and attempt < attempts:
-                time.sleep(_backoff_seconds(attempt))
-                last_error = _client_http_message(response.status_code, response.text)
-                continue
-            if response.status_code in {401, 403}:
-                result["http_status"] = response.status_code
-                result["error"] = _client_http_message(response.status_code, response.text)
-                return result
-            if response.status_code >= 400:
-                result["http_status"] = response.status_code
-                result["error"] = _client_http_message(response.status_code, response.text)
-                return result
-            try:
-                data = response.json()
-            except ValueError:
-                result["http_status"] = response.status_code
-                result["error"] = "OpenRouter returned a non-JSON HTTP body."
-                return result
-            err = data.get("error") if isinstance(data, dict) else None
-            if err:
-                result["http_status"] = response.status_code
-                result["error"] = _redact(str(err.get("message") if isinstance(err, dict) else err))[:400]
-                return result
-            choices = data.get("choices") or []
-            content = ((choices[0].get("message") or {}).get("content") if choices else "") or ""
-            if not str(content).strip():
-                result["http_status"] = response.status_code
-                result["error"] = "OpenRouter returned empty content."
+            from google import genai
+
+            client = genai.Client(api_key=settings.gemini_api_key)
+            response = client.models.generate_content(
+                model=model,
+                contents="Reply with the single word ok.",
+                config=types.GenerateContentConfig(temperature=0, max_output_tokens=16),
+            )
+            text = (getattr(response, "text", None) or "").strip()
+            if not text:
+                result["error"] = "Gemini returned empty content."
                 return result
             result["ok"] = True
             result["status"] = "SUCCESS"
-            result["http_status"] = response.status_code
+            result["http_status"] = 200
             result["error"] = None
             return result
-        except httpx.TimeoutException:
-            last_error = "The OpenRouter request timed out."
-            http_status = None
-            if attempt < attempts:
+        except Exception as exc:
+            mapped = _map_gemini_exception(exc)
+            last_error = str(mapped)
+            result["http_status"] = mapped.http_status
+            if mapped.retryable and attempt < attempts:
                 time.sleep(_backoff_seconds(attempt))
                 continue
-        except httpx.HTTPError:
-            last_error = "Network error contacting OpenRouter."
-            if attempt < attempts:
-                time.sleep(_backoff_seconds(attempt))
-                continue
-    result["http_status"] = http_status
+            result["error"] = last_error
+            return result
     result["error"] = last_error
     return result

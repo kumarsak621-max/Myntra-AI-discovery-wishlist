@@ -23,7 +23,7 @@ def _iso(value) -> str:
 
 
 def run_diagnostics() -> dict:
-    from app.ai.provider import test_openrouter_connection
+    from app.ai.provider import test_gemini_connection
     from app.database import SessionLocal, get_ai_diagnostics, get_database_diagnostics, init_db, sqlite_path
     from app.models import Analysis, CollectionRun, Opportunity, Segment, Source, Theme
     from app.pipeline.quantification import label_distribution, problem_rows
@@ -35,7 +35,7 @@ def run_diagnostics() -> dict:
     try:
         base = get_database_diagnostics(db)
         ai = get_ai_diagnostics(db)
-        probe = test_openrouter_connection(settings)
+        probe = test_gemini_connection(settings)
         gp = (
             db.query(Source)
             .filter(Source.platform == "google_play", Source.app_id == OFFICIAL_GOOGLE_PLAY_APP_ID)
@@ -79,7 +79,7 @@ def run_diagnostics() -> dict:
                 "last_run_errors": getattr(last_run, "errors_json", None) or "[]",
             },
             "ai": {
-                "provider": ai.get("ai_provider") or "OpenRouter",
+                "provider": ai.get("ai_provider") or "Google Gemini",
                 "model": ai.get("ai_model") or settings.resolved_model,
                 "credentials_configured": ai.get("api_key_configured") or "NO",
                 "connection_status": probe.get("status") or "FAILED",

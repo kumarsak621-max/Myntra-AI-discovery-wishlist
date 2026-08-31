@@ -16,8 +16,8 @@ from app.schemas import NormalizedReview
 def _settings(**kwargs) -> Settings:
     values = {
         "collection_rate_limit_seconds": 0,
-        "openrouter_api_key": "unit-test-key",
-        "openrouter_model": "google/gemini-2.5-flash",
+        "gemini_api_key": "unit-test-key",
+        "gemini_model": "gemini-2.5-flash",
         "ai_rate_limit_seconds": 0,
         "ai_request_batch_size": 2,
         "ai_retry_attempts": 2,
@@ -87,7 +87,7 @@ class FakeProvider:
 
     @property
     def provider_name(self) -> str:
-        return "openrouter"
+        return "gemini"
 
     @property
     def model(self) -> str:

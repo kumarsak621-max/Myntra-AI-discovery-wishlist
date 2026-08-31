@@ -62,14 +62,14 @@ class DiscoveryEngineApp:
         init_db()
         startup_line("Database initialized")
 
-        from services.ai_service import AIProvider
+        from services.ai_service import GeminiAIService
 
-        self.ai = AIProvider(self.settings)
+        self.ai = GeminiAIService(self.settings)
         if self.ai.available():
-            startup_line(f"AI provider initialized ({self.settings.ai_provider} / {self.settings.resolved_model})")
+            startup_line(f"AI provider initialized (Google Gemini / {self.settings.resolved_model})")
         else:
             startup_line(
-                "AI provider initialized (no API key — collection still works; analysis skipped until OPENROUTER_API_KEY is set)",
+                "AI provider initialized (Gemini API key is not configured. Collection still works; analysis is skipped.)",
                 ok=True,
             )
 

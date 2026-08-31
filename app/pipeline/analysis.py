@@ -1,4 +1,4 @@
-"""Per-review AI analysis with batched OpenRouter calls and content-hash caching."""
+"""Per-review AI analysis with batched Gemini calls and content-hash caching."""
 
 from __future__ import annotations
 
@@ -74,7 +74,7 @@ def persist_analysis(
     row.provider = provider.provider_name
     row.model = provider.model
     row.raw_response = (raw or "")[:20000]
-    row.parse_error = redact_secrets(error or "")
+    row.parse_error = redact_secrets(error or "")  # stored analysis_error; never contains the API key
     row.is_valid_json = parsed is not None
     row.analyzed_at = utcnow()
     row.status = "analyzed" if parsed is not None else "failed"
@@ -265,7 +265,7 @@ def analyze_new_reviews(
 
     if not provider.available():
         message = (
-            "OpenRouter API key is not configured. "
+            "Gemini API key is not configured. "
             f"{total_pending} real Myntra-valid reviews are waiting for analysis."
         )
         logger.error(message)

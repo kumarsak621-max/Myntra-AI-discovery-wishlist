@@ -6,6 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 import logging
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -25,6 +26,16 @@ OFFICIAL_APPLE_APP_NAME = "Myntra Fashion Shopping App"
 BANNED_APP_IDS = frozenset({"com.grofers.customerapp", "960335206"})
 
 
+def normalize_gemini_model(value: str | None) -> str:
+    """Gemini API model id. Strips leftover OpenRouter-style google/ prefixes."""
+    text = (value or "").strip() or "gemini-2.5-flash"
+    if text.lower().startswith("google/"):
+        text = text.split("/", 1)[1]
+    if text.lower().startswith("models/"):
+        text = text.split("/", 1)[1]
+    return text.strip() or "gemini-2.5-flash"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=str(ROOT_DIR / ".env"),
@@ -32,11 +43,8 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    ai_provider: str = "openrouter"
-    ai_model: str = "google/gemini-2.5-flash"
-    openrouter_api_key: str = ""
-    openrouter_model: str = ""
-    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    ai_provider: str = "gemini"
+    ai_model: str = "gemini-2.5-flash"
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
 
@@ -71,22 +79,23 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8000
 
+    @model_validator(mode="after")
+    def _force_gemini_provider(self):
+        """Leftover AI_PROVIDER/OpenRouter env vars must not switch the production path."""
+        self.ai_provider = "gemini"
+        if not (self.gemini_model or "").strip():
+            self.gemini_model = "gemini-2.5-flash"
+        if not (self.ai_model or "").strip():
+            self.ai_model = "gemini-2.5-flash"
+        return self
+
     @property
     def resolved_model(self) -> str:
-        if self.ai_provider.lower() == "openrouter":
-            return self.openrouter_model or self.ai_model
-        if self.ai_provider.lower() == "gemini":
-            return self.gemini_model or self.ai_model
-        return self.ai_model
+        return normalize_gemini_model(self.gemini_model or self.ai_model or "gemini-2.5-flash")
 
     @property
     def has_ai_credentials(self) -> bool:
-        provider = self.ai_provider.lower()
-        if provider == "openrouter":
-            return bool(self.openrouter_api_key.strip())
-        if provider == "gemini":
-            return bool(self.gemini_api_key.strip())
-        return False
+        return bool((self.gemini_api_key or "").strip())
 
     @property
     def google_play_url(self) -> str:
@@ -125,13 +134,14 @@ def _streamlit_secret(name: str) -> str | None:
 @lru_cache
 def get_settings() -> Settings:
     settings = Settings()
-    secret_key = _streamlit_secret("OPENROUTER_API_KEY")
-    secret_model = _streamlit_secret("OPENROUTER_MODEL")
+    secret_key = _streamlit_secret("GEMINI_API_KEY")
+    secret_model = _streamlit_secret("GEMINI_MODEL")
     if secret_key:
-        settings.openrouter_api_key = secret_key
+        settings.gemini_api_key = secret_key
     if secret_model:
-        settings.openrouter_model = secret_model
+        settings.gemini_model = secret_model
         settings.ai_model = secret_model
+    settings.ai_provider = "gemini"
     return settings
 
 

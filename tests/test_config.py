@@ -8,6 +8,7 @@ from config.settings import (
     Settings,
     _streamlit_secret,
     get_settings,
+    normalize_gemini_model,
     reload_settings,
 )
 
@@ -20,15 +21,21 @@ def test_official_myntra_ids_are_defaults():
     assert settings.apple_fallback_region == "us"
 
 
-def test_default_openrouter_model_without_key():
-    settings = Settings(openrouter_api_key="", openrouter_model="")
-    assert settings.resolved_model == "google/gemini-2.5-flash"
+def test_default_gemini_model_without_key():
+    settings = Settings(gemini_api_key="", gemini_model="")
+    assert settings.resolved_model == "gemini-2.5-flash"
     assert settings.has_ai_credentials is False
+    assert settings.ai_provider == "gemini"
+
+
+def test_normalize_strips_openrouter_style_prefix():
+    assert normalize_gemini_model("google/gemini-2.5-flash") == "gemini-2.5-flash"
+    assert normalize_gemini_model("models/gemini-2.5-flash") == "gemini-2.5-flash"
 
 
 def test_streamlit_secret_is_none_outside_streamlit():
-    assert _streamlit_secret("OPENROUTER_API_KEY") is None
-    assert _streamlit_secret("OPENROUTER_MODEL") is None
+    assert _streamlit_secret("GEMINI_API_KEY") is None
+    assert _streamlit_secret("GEMINI_MODEL") is None
 
 
 def test_streamlit_secrets_overlay(monkeypatch):
@@ -36,8 +43,8 @@ def test_streamlit_secrets_overlay(monkeypatch):
 
     def fake_secret(name: str):
         mapping = {
-            "OPENROUTER_API_KEY": "unit-test-openrouter-key",
-            "OPENROUTER_MODEL": "google/gemini-2.5-flash",
+            "GEMINI_API_KEY": "unit-test-gemini-key",
+            "GEMINI_MODEL": "gemini-2.5-flash",
         }
         return mapping.get(name)
 
@@ -45,9 +52,10 @@ def test_streamlit_secrets_overlay(monkeypatch):
     settings_mod.get_settings.cache_clear()
     try:
         settings = settings_mod.get_settings()
-        assert settings.openrouter_api_key == "unit-test-openrouter-key"
-        assert settings.resolved_model == "google/gemini-2.5-flash"
+        assert settings.gemini_api_key == "unit-test-gemini-key"
+        assert settings.resolved_model == "gemini-2.5-flash"
         assert settings.has_ai_credentials is True
+        assert settings.ai_provider == "gemini"
     finally:
         settings_mod.get_settings.cache_clear()
 

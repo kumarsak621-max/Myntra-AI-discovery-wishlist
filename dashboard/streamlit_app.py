@@ -84,8 +84,8 @@ def _analysis_blocker(
     if not ai_ok:
         return (
             f"{stored} real reviews are stored, but none have been analyzed. "
-            "OpenRouter API key is not configured. "
-            "Set OPENROUTER_API_KEY in Streamlit Secrets or .env, then click Test AI Connection."
+            "Gemini API key is not configured. "
+            "Set GEMINI_API_KEY in Streamlit Secrets or .env, then click Test Gemini Connection."
         )
     if failed and not analyzed:
         extra = f" Last error: {last_error}." if last_error else ""
@@ -96,7 +96,7 @@ def _analysis_blocker(
     waiting = pending or stored
     return (
         f"{waiting} real reviews are awaiting AI analysis. "
-        "Click Test AI Connection, then Analyze Pending Reviews or 🚀 Run Full Discovery Pipeline."
+        "Click Test Gemini Connection, then Analyze Pending Reviews or 🚀 Run Full Discovery Pipeline."
     )
 
 
@@ -551,7 +551,7 @@ def _diagnostics() -> None:
         if last_ok and last_ok.finished_at:
             st.caption(last_ok.finished_at.isoformat())
         st.write("New reviews since previous sync:", (last.get("stats") or {}).get("new", last_ok.new_count if last_ok else 0))
-        st.write("Provider: OpenRouter")
+        st.write("Provider: Google Gemini")
         st.write("Model:", settings.resolved_model)
         last_ai = st.session_state.get("last_analysis")
         if settings.has_ai_credentials:
@@ -568,80 +568,65 @@ def _diagnostics() -> None:
         st.error(f"Last collection run failed: {latest.notes}")
 
 
+def _render_gemini_probe(probe: dict) -> None:
+    st.subheader("GEMINI CONNECTION TEST")
+    st.write("AI Provider:")
+    st.write(probe.get("provider") or "Google Gemini")
+    st.write("Model:")
+    st.write(probe.get("model") or "")
+    st.write("API Key:")
+    st.write(probe.get("credentials") or "Missing")
+    st.write("Connection:")
+    st.write(probe.get("status") or "FAILED")
+    st.write("Error:")
+    st.write(probe.get("error") or "None")
+    if probe.get("ok") and probe.get("status") == "SUCCESS":
+        st.success("Gemini accepted a live test request.")
+    else:
+        st.error(probe.get("error") or "Gemini connection test failed.")
+
+
 def _ai_analysis_status_panel(ai_ok: bool) -> None:
-    from app.ai.provider import test_openrouter_connection
+    from app.ai.provider import test_gemini_connection
 
     reload_settings()
     ai = get_ai_diagnostics()
+    key_label = "Configured" if ai.get("api_key_configured") == "YES" else "Missing"
     st.subheader("AI ANALYSIS STATUS")
-    st.write("Provider:")
-    st.write(ai.get("ai_provider") or "OpenRouter")
-    st.write("Model:")
-    st.write(ai.get("ai_model") or "google/gemini-2.5-flash")
-    st.write("API key:")
-    st.write("Configured" if ai.get("api_key_configured") == "YES" else "Missing")
-    st.write("Pending:")
+    st.write("AI PROVIDER")
+    st.write(ai.get("ai_provider") or "Google Gemini")
+    st.write("MODEL")
+    st.write(ai.get("ai_model") or "gemini-2.5-flash")
+    st.write("API KEY")
+    st.write(key_label)
+    st.write("PENDING")
     st.write(ai.get("pending_reviews"))
-    st.write("Analyzed:")
+    st.write("ANALYZED")
     st.write(ai.get("analyzed_reviews"))
-    st.write("Failed:")
+    st.write("FAILED")
     st.write(ai.get("failed_reviews"))
-    st.write("Last successful analysis:")
+    st.write("LAST SUCCESSFUL ANALYSIS")
     st.write(ai.get("last_successful_analysis") or "None")
-    st.write("Last failure:")
-    st.write(ai.get("last_failed_analysis") or "None")
-    st.write("Last error:")
+    st.write("LAST ERROR")
     st.write(ai.get("last_error") or "None")
-    if ai.get("last_http_status"):
-        st.write("Last HTTP status:")
-        st.write(ai.get("last_http_status"))
     st.caption("API key is never displayed.")
 
     test_col, analyze_col = st.columns(2)
     with test_col:
-        run_test = st.button("Test AI Connection")
+        run_test = st.button("Test Gemini Connection")
     with analyze_col:
         run_pending = st.button("Analyze Pending Reviews", key="analyze_pending_status")
     if run_test:
-        with st.spinner("Testing OpenRouter connection…"):
-            probe = test_openrouter_connection()
+        with st.spinner("Testing Gemini connection…"):
+            probe = test_gemini_connection()
         st.session_state["ai_connection_test"] = probe
-        st.subheader("AI CONNECTION TEST")
-        st.write("Provider:")
-        st.write(probe.get("provider") or "OpenRouter")
-        st.write("Model:")
-        st.write(probe.get("model") or "")
-        st.write("Credentials:")
-        st.write(probe.get("credentials") or "Missing")
-        st.write("Status:")
-        st.write(probe.get("status") or "FAILED")
-        st.write("HTTP status:")
-        st.write(probe.get("http_status") if probe.get("http_status") is not None else "N/A")
-        st.write("Error:")
-        st.write(probe.get("error") or "None")
-        if probe.get("ok"):
-            st.success("OpenRouter accepted a live test request.")
-        else:
-            st.error(probe.get("error") or "OpenRouter connection test failed.")
+        _render_gemini_probe(probe)
     elif st.session_state.get("ai_connection_test"):
-        probe = st.session_state["ai_connection_test"]
-        st.subheader("AI CONNECTION TEST")
-        st.write("Provider:")
-        st.write(probe.get("provider") or "OpenRouter")
-        st.write("Model:")
-        st.write(probe.get("model") or "")
-        st.write("Credentials:")
-        st.write(probe.get("credentials") or "Missing")
-        st.write("Status:")
-        st.write(probe.get("status") or "FAILED")
-        st.write("HTTP status:")
-        st.write(probe.get("http_status") if probe.get("http_status") is not None else "N/A")
-        st.write("Error:")
-        st.write(probe.get("error") or "None")
+        _render_gemini_probe(st.session_state["ai_connection_test"])
     if run_pending:
         reload_settings()
         if not get_settings().has_ai_credentials:
-            st.error("OpenRouter API key is not configured.")
+            st.error("Gemini API key is not configured.")
         elif get_review_count() == 0:
             st.info(EMPTY)
         else:
@@ -691,7 +676,7 @@ def _live_data(ai_ok: bool) -> None:
 
     analyze = st.checkbox("Analyze new reviews after each poll", value=ai_ok)
     if analyze and not ai_ok:
-        st.warning("OpenRouter API key is not configured. Collection will run; analysis will be skipped.")
+        st.warning("Gemini API key is not configured. Collection will run; analysis will be skipped.")
         analyze = False
     st.session_state["analyze_on_collect"] = analyze
 
@@ -740,7 +725,7 @@ def _live_data(ai_ok: bool) -> None:
     if st.button("Analyze Pending Reviews"):
         reload_settings()
         if not get_settings().has_ai_credentials:
-            st.error("OpenRouter API key is not configured.")
+            st.error("Gemini API key is not configured.")
         elif get_review_count() == 0:
             st.info(EMPTY)
         else:
@@ -802,7 +787,7 @@ def _run_full_discovery(ai_ok: bool) -> None:
             result = AnalysisRunResult()
             if not get_settings().has_ai_credentials:
                 steps["analyze"] = "failed"
-                msg = "OpenRouter API key is not configured."
+                msg = "Gemini API key is not configured."
                 st.error(msg)
                 result.last_error = msg
                 st.session_state["last_analysis"] = {"status": "Failed", "message": msg}
@@ -838,7 +823,7 @@ def _run_full_discovery(ai_ok: bool) -> None:
             if result.analyzed:
                 box.update(label="Discovery pipeline complete", state="complete")
             else:
-                box.update(label="Collection saved — analysis needs OpenRouter (see Live Data)", state="error")
+                box.update(label="Collection saved — analysis needs Gemini (see Live Data)", state="error")
             st.session_state["last_analysis"] = {
                 "status": "Connected" if result.analyzed else ("Failed" if result.failed or result.last_error else "Configured"),
                 "message": (
@@ -1029,10 +1014,10 @@ def _run_analyze() -> None:
     db = _db()
     try:
         if not get_settings().has_ai_credentials:
-            st.error("OpenRouter API key is not configured.")
+            st.error("Gemini API key is not configured.")
             st.session_state["last_analysis"] = {
                 "status": "Failed",
-                "message": "OpenRouter API key is not configured.",
+                "message": "Gemini API key is not configured.",
             }
             return
         with st.spinner("Analyzing stored Myntra-valid reviews…"):
