@@ -64,6 +64,10 @@ class CollectionStats(BaseModel):
     duration_seconds: float = 0.0
     errors: list[str] = Field(default_factory=list)
     source_validations: list[SourceValidation] = Field(default_factory=list)
+    by_source: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    mode: str = ""
+    window_start: datetime | None = None
+    in_window: int = 0
 
 
 class InformationSeekingItem(BaseModel):

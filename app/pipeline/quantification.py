@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections import Counter, defaultdict
 from datetime import datetime
 from typing import Any
@@ -11,6 +12,8 @@ from sqlalchemy.orm import Session
 
 from app.models import Analysis, Review
 from config.settings import official_ids
+
+logger = logging.getLogger(__name__)
 
 
 def pct(count: int, denominator: int) -> float:
@@ -31,15 +34,17 @@ def is_myntra_evidence(review: Review) -> bool:
     return bool(review.is_valid_source) and (review.app_id or "") in official_ids()
 
 
-def review_query(db: Session, *, myntra_only: bool = False):
+def review_query(db: Session, *, myntra_only: bool = False, since: datetime | None = None):
     q = db.query(Review).filter(Review.is_duplicate.is_(False), Review.is_empty.is_(False))
     if myntra_only:
         q = q.filter(Review.is_valid_source.is_(True), Review.app_id.in_(list(official_ids())))
+    if since is not None:
+        q = q.filter(Review.review_date.isnot(None), Review.review_date >= since)
     return q
 
 
-def overview_metrics(db: Session) -> dict[str, Any]:
-    all_reviews = review_query(db).all()
+def overview_metrics(db: Session, *, since: datetime | None = None, myntra_only: bool = False) -> dict[str, Any]:
+    all_reviews = review_query(db, myntra_only=myntra_only, since=since).all()
     myntra = [r for r in all_reviews if is_myntra_evidence(r)]
     reference = [r for r in all_reviews if not is_myntra_evidence(r)]
     analyzed = [r for r in all_reviews if r.analysis and r.analysis.is_valid_json]
@@ -51,6 +56,18 @@ def overview_metrics(db: Session) -> dict[str, Any]:
     by_source = Counter(r.source for r in all_reviews)
     by_rating = Counter(str(r.rating) for r in all_reviews if r.rating is not None)
     by_classification = Counter(r.data_classification for r in all_reviews)
+    ratings = [r.rating for r in all_reviews if r.rating is not None]
+    dates = [r.review_date for r in all_reviews if r.review_date]
+    barriers = label_distribution_safe(db, "barriers", myntra_only=True, since=since)
+    wishlist = signal_counts(db, myntra_only=True, since=since)
+    intents = label_distribution_safe(db, "intent", myntra_only=True, since=since)
+    uncertainties = label_distribution_safe(db, "uncertainties", myntra_only=True, since=since)
+
+    from app.models import Opportunity, Theme
+
+    theme_count = db.query(Theme).count()
+    opportunity_count = db.query(Opportunity).count()
+    problems = root_cause_distribution(db, myntra_only=True, since=since)
     return {
         "total_reviews": len(all_reviews),
         "myntra_reviews": len(myntra),
@@ -58,11 +75,39 @@ def overview_metrics(db: Session) -> dict[str, Any]:
         "analyzed_reviews": len(analyzed),
         "relevant_reviews": len(relevant),
         "relevant_pct_of_analyzed": pct(len(relevant), len(analyzed)),
+        "google_play_reviews": by_source.get("google_play", 0),
+        "apple_reviews": by_source.get("apple_app_store", 0),
+        "average_rating": round(sum(ratings) / len(ratings), 2) if ratings else None,
+        "date_from": min(dates).isoformat() if dates else None,
+        "date_to": max(dates).isoformat() if dates else None,
+        "theme_count": theme_count,
+        "opportunity_count": opportunity_count,
+        "top_barriers": barriers[:5],
+        "top_intents": intents[:5],
+        "top_uncertainties": uncertainties[:5],
+        "top_problems": problems[:5],
+        "wishlist_signals": wishlist.get("wishlist_signal", 0),
+        "purchase_hesitation": wishlist.get("purchase_hesitation", 0),
+        "rating_1": sum(1 for r in all_reviews if r.rating == 1),
+        "rating_2": sum(1 for r in all_reviews if r.rating == 2),
+        "rating_3": sum(1 for r in all_reviews if r.rating == 3),
+        "rating_4": sum(1 for r in all_reviews if r.rating == 4),
+        "rating_5": sum(1 for r in all_reviews if r.rating == 5),
         "by_source": dict(by_source),
         "by_rating": dict(by_rating),
         "by_classification": dict(by_classification),
         "synthetic_count": sum(1 for r in all_reviews if r.is_synthetic),
     }
+
+
+def label_distribution_safe(
+    db: Session, field: str, *, myntra_only: bool = False, since: datetime | None = None
+) -> list[dict[str, Any]]:
+    try:
+        return label_distribution(db, field, myntra_only=myntra_only, since=since)
+    except Exception as exc:
+        logger.warning("Could not compute %s distribution: %s", field, exc)
+        return []
 
 
 def label_distribution(
@@ -71,8 +116,9 @@ def label_distribution(
     *,
     myntra_only: bool = False,
     relevant_only: bool = True,
+    since: datetime | None = None,
 ) -> list[dict[str, Any]]:
-    rows = review_query(db, myntra_only=myntra_only).all()
+    rows = review_query(db, myntra_only=myntra_only, since=since).all()
     items: list[tuple[Review, Analysis]] = []
     for review in rows:
         analysis = review.analysis
@@ -124,8 +170,8 @@ def label_distribution(
     return ranked
 
 
-def signal_counts(db: Session, *, myntra_only: bool = False) -> dict[str, Any]:
-    rows = review_query(db, myntra_only=myntra_only).all()
+def signal_counts(db: Session, *, myntra_only: bool = False, since: datetime | None = None) -> dict[str, Any]:
+    rows = review_query(db, myntra_only=myntra_only, since=since).all()
     analyzed = [r for r in rows if r.analysis and r.analysis.is_valid_json]
     denom = len(analyzed) or 1
     wishlist = sum(
@@ -152,8 +198,8 @@ def signal_counts(db: Session, *, myntra_only: bool = False) -> dict[str, Any]:
     }
 
 
-def time_trends(db: Session, *, myntra_only: bool = False) -> list[dict[str, Any]]:
-    rows = review_query(db, myntra_only=myntra_only).all()
+def time_trends(db: Session, *, myntra_only: bool = False, since: datetime | None = None) -> list[dict[str, Any]]:
+    rows = review_query(db, myntra_only=myntra_only, since=since).all()
     buckets: Counter[str] = Counter()
     for review in rows:
         dt: datetime | None = review.review_date or review.collected_at
@@ -199,3 +245,204 @@ def information_seeking(db: Session, *, myntra_only: bool = False) -> list[dict[
         }
         for src, count in counts.most_common()
     ]
+
+
+def daily_review_trends(db: Session, *, myntra_only: bool = False, since: datetime | None = None) -> list[dict[str, Any]]:
+    """Counts by review_date day only. Collection time is never used."""
+    rows = review_query(db, myntra_only=myntra_only, since=since).all()
+    counts: Counter[str] = Counter()
+    rating_sum: dict[str, list[int]] = defaultdict(list)
+    rating_buckets: dict[str, Counter[int]] = defaultdict(Counter)
+    for review in rows:
+        if not review.review_date:
+            continue
+        day = review.review_date.strftime("%Y-%m-%d")
+        counts[day] += 1
+        if review.rating is not None:
+            rating_sum[day].append(review.rating)
+            rating_buckets[day][int(review.rating)] += 1
+    out = []
+    for day in sorted(counts):
+        ratings = rating_sum.get(day) or []
+        stars = rating_buckets.get(day) or Counter()
+        out.append(
+            {
+                "day": day,
+                "reviews": counts[day],
+                "average_rating": round(sum(ratings) / len(ratings), 2) if ratings else None,
+                "rating_1": stars.get(1, 0),
+                "rating_2": stars.get(2, 0),
+                "rating_3": stars.get(3, 0),
+                "rating_4": stars.get(4, 0),
+                "rating_5": stars.get(5, 0),
+            }
+        )
+    return out
+
+
+def _json_labels(analysis: Analysis, field: str) -> list[str]:
+    attr = {
+        "intent": "intent_json",
+        "barriers": "barriers_json",
+        "uncertainties": "uncertainties_json",
+        "root_cause": None,
+        "themes": None,
+    }.get(field, "barriers_json")
+    if field == "root_cause":
+        statement = (analysis.root_cause or "").strip()
+        return [statement] if statement else []
+    if field == "themes":
+        bag = []
+        for key in ("barriers_json", "uncertainties_json", "intent_json"):
+            bag.extend(str(x).strip() for x in _loads(getattr(analysis, key)) if str(x).strip())
+        if (analysis.root_cause or "").strip():
+            bag.append(analysis.root_cause.strip())
+        return list(dict.fromkeys(bag))
+    labels = [str(x).strip() for x in _loads(getattr(analysis, attr)) if str(x).strip()]
+    return list(dict.fromkeys(labels))
+
+
+def label_window_momentum(
+    db: Session,
+    field: str,
+    *,
+    since: datetime,
+    myntra_only: bool = True,
+    now: datetime | None = None,
+    min_count: int = 3,
+) -> list[dict[str, Any]]:
+    """First-half vs second-half of the window. Descriptive only — not a significance test."""
+    from app.pipeline.dates import ensure_aware, utcnow
+
+    start = ensure_aware(since)
+    end = ensure_aware(now) or utcnow()
+    if start is None:
+        return []
+    midpoint = start + (end - start) / 2
+    rows = review_query(db, myntra_only=myntra_only, since=start).all()
+    first: Counter[str] = Counter()
+    second: Counter[str] = Counter()
+    evidence: dict[str, list[int]] = defaultdict(list)
+    daily: dict[str, Counter[str]] = defaultdict(Counter)
+
+    for review in rows:
+        analysis = review.analysis
+        if not analysis or not analysis.is_valid_json:
+            continue
+        stamp = ensure_aware(review.review_date)
+        if stamp is None:
+            continue
+        labels = _json_labels(analysis, field)
+        day = stamp.strftime("%Y-%m-%d")
+        bucket = first if stamp < midpoint else second
+        for label in labels:
+            bucket[label] += 1
+            evidence[label].append(review.id)
+            daily[label][day] += 1
+
+    names = set(first) | set(second)
+    ranked = []
+    for label in names:
+        a = first[label]
+        b = second[label]
+        total = a + b
+        if total < min_count:
+            momentum = "insufficient data"
+        elif b > a * 1.25 and b >= 2:
+            momentum = "emerging"
+        elif a > b * 1.25 and a >= 2:
+            momentum = "declining"
+        else:
+            momentum = "stable"
+        ranked.append(
+            {
+                "label": label,
+                "count": total,
+                "first_half": a,
+                "second_half": b,
+                "momentum": momentum,
+                "review_ids": evidence[label][:50],
+                "by_day": dict(daily[label]),
+                "note": "Descriptive split of this window, not a statistical significance test.",
+            }
+        )
+    ranked.sort(key=lambda x: (-int(x["count"]), str(x["label"])))
+    return ranked
+
+
+def root_cause_distribution(
+    db: Session, *, myntra_only: bool = True, since: datetime | None = None
+) -> list[dict[str, Any]]:
+    rows = review_query(db, myntra_only=myntra_only, since=since).all()
+    counts: Counter[str] = Counter()
+    review_ids: dict[str, list[int]] = defaultdict(list)
+    analyzed = 0
+    for review in rows:
+        analysis = review.analysis
+        if not analysis or not analysis.is_valid_json:
+            continue
+        analyzed += 1
+        statement = (analysis.root_cause or "").strip()
+        if not statement:
+            continue
+        counts[statement] += 1
+        review_ids[statement].append(review.id)
+    return [
+        {
+            "label": label,
+            "count": count,
+            "percentage": pct(count, analyzed),
+            "denominator": analyzed,
+            "review_ids": review_ids[label][:50],
+        }
+        for label, count in counts.most_common()
+    ]
+
+
+def source_live_status(db: Session) -> dict[str, Any]:
+    """Freshness for official Myntra sources. Never claims a live stream."""
+    from app.models import CollectionRun, Source
+    from app.pipeline.dates import ensure_aware
+    from config.settings import OFFICIAL_APPLE_APP_ID, OFFICIAL_GOOGLE_PLAY_APP_ID
+
+    def _latest_review(source: str, app_id: str) -> datetime | None:
+        row = (
+            db.query(Review)
+            .filter(
+                Review.source == source,
+                Review.app_id == app_id,
+                Review.is_empty.is_(False),
+                Review.review_date.isnot(None),
+            )
+            .order_by(Review.review_date.desc())
+            .first()
+        )
+        return ensure_aware(row.review_date) if row else None
+
+    def _source_row(platform: str, app_id: str) -> Source | None:
+        return (
+            db.query(Source)
+            .filter(Source.platform == platform, Source.app_id == app_id)
+            .order_by(Source.last_collection_at.desc())
+            .first()
+        )
+
+    last_run = db.query(CollectionRun).order_by(CollectionRun.id.desc()).first()
+    last_ok = (
+        db.query(CollectionRun)
+        .filter(CollectionRun.status.in_(["completed", "completed_with_errors"]))
+        .order_by(CollectionRun.id.desc())
+        .first()
+    )
+    return {
+        "google_play": {
+            "source": _source_row("google_play", OFFICIAL_GOOGLE_PLAY_APP_ID),
+            "latest_review_at": _latest_review("google_play", OFFICIAL_GOOGLE_PLAY_APP_ID),
+        },
+        "apple_app_store": {
+            "source": _source_row("apple_app_store", OFFICIAL_APPLE_APP_ID),
+            "latest_review_at": _latest_review("apple_app_store", OFFICIAL_APPLE_APP_ID),
+        },
+        "last_run": last_run,
+        "last_successful_run": last_ok,
+    }

@@ -18,7 +18,7 @@ from app.models import Analysis, Review, utcnow
 from app.schemas import RootCauseItem
 from config.settings import official_ids
 
-logger = logging.getLogger(__name__)
+ANALYSIS_VERSION = "1"
 
 ProgressCallback = Callable[[dict[str, Any]], None]
 
@@ -44,6 +44,8 @@ def persist_analysis(db: Session, review: Review, parsed, raw: str, error: str, 
     row.parse_error = error or ""
     row.is_valid_json = parsed is not None
     row.analyzed_at = utcnow()
+    row.status = "analyzed" if parsed is not None else "failed"
+    row.analysis_version = ANALYSIS_VERSION
 
     if parsed is not None:
         row.relevance = parsed.relevance
@@ -85,11 +87,15 @@ def reviews_needing_analysis(db: Session) -> list[Review]:
     needed: list[Review] = []
     for review in rows:
         analysis = review.analysis
-        if analysis is None:
+        if analysis is None or getattr(analysis, "status", "") in {"", "pending"}:
             needed.append(review)
+            continue
+        if analysis.status == "failed" and analysis.content_hash == review.content_hash:
             continue
         if analysis.content_hash != review.content_hash:
             needed.append(review)
+            continue
+        if analysis.status == "analyzed" and analysis.is_valid_json:
             continue
         if not analysis.is_valid_json:
             needed.append(review)
@@ -126,8 +132,15 @@ def analyze_new_reviews(
         pending = pending[:limit]
 
     if not pending:
+        from app.database import get_review_count
+
+        message = (
+            "Not enough real feedback collected for analysis."
+            if get_review_count(db) == 0
+            else "No new Myntra-valid reviews needed analysis (already analyzed)."
+        )
         if progress:
-            progress({"stage": "analysis", "status": "skipped", "message": "No new reviews to analyze"})
+            progress({"stage": "analysis", "status": "skipped", "message": message})
         return 0
 
     if not provider.available():

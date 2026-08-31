@@ -54,6 +54,10 @@ class Settings(BaseSettings):
 
     collection_rate_limit_seconds: float = 1.0
     collection_retry_attempts: int = 3
+    collection_window_days: int = 30
+    google_play_window_safety_limit: int = 800
+    apple_window_safety_limit: int = 500
+    refresh_safety_limit: int = 150
     expected_app_name: str = OFFICIAL_GOOGLE_PLAY_APP_NAME
     expected_apple_app_name: str = OFFICIAL_APPLE_APP_NAME
 

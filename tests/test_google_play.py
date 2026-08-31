@@ -119,3 +119,43 @@ def test_google_play_metadata_failure_does_not_crash():
     assert validation.validation_status == "ERROR"
     assert "play down" in validation.warning
     assert validation.app_id == "com.grofers.customerapp"
+
+
+def test_google_play_stops_after_page_older_than_cutoff():
+    from datetime import timedelta
+
+    now = datetime(2026, 8, 31, tzinfo=timezone.utc)
+    cutoff = now - timedelta(days=30)
+    recent = {
+        "reviewId": "recent",
+        "content": "size chart is confusing so I did not buy",
+        "score": 2,
+        "at": now - timedelta(days=3),
+    }
+    old = {
+        "reviewId": "old",
+        "content": "old review outside window",
+        "score": 5,
+        "at": now - timedelta(days=45),
+    }
+    extra = {
+        "reviewId": "should-not-fetch",
+        "content": "should not be requested",
+        "score": 4,
+        "at": now - timedelta(days=50),
+    }
+    fake = FakeGPS([[recent], [old], [extra]])
+    settings = Settings(
+        google_play_app_id="com.myntra.android",
+        google_play_batch_size=1,
+        collection_rate_limit_seconds=0,
+        collection_retry_attempts=1,
+    )
+    collector = GooglePlayCollector(settings=settings, scraper=fake)
+    reviews = collector.collect(safety_limit=50, stop_when_older_than=cutoff)
+    ids = [r.source_review_id for r in reviews]
+    assert "recent" in ids
+    assert "old" in ids
+    assert "should-not-fetch" not in ids
+    assert len(fake.review_calls) == 2
+

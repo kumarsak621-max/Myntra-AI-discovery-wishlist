@@ -114,16 +114,23 @@ Main file for Streamlit Cloud: `app.py`
 
 ## Data Collection
 
-On **Data Collection**:
+The default analysis window is **last 30 days**, computed as `now − 30 days` in UTC. Calendar dates are never hard-coded.
 
-- **Collect Google Play Reviews** — live Play Store reviews for `com.myntra.android`
-- **Collect Apple App Store Reviews** — iTunes RSS for `907394059` (India first)
-- **Collect All** — both sources
-- **Analyze stored Myntra-valid reviews** — OpenRouter JSON analysis for new or changed reviews only
+On **Live Data** / Overview:
+
+- **Collect Last 30 Days** — paginated Google Play + Apple RSS until reviews are older than the cutoff, the source is exhausted, or a safety limit is reached. Filtering uses the **review timestamp**, not collection time.
+- **Refresh Latest Reviews** — incremental near-real-time poll of newly available public reviews. Existing `review_id` / content hashes are skipped. Only **pending** (or changed) reviews are sent to the AI pipeline.
+- Per-source buttons still exist for Google Play (`com.myntra.android`) and Apple (`907394059`, India first, US fallback).
+
+This is **not** a live stream. Public store feeds are polled on demand. The UI labels the feature:
+
+`Near-real-time — refreshed from the public source`
+
+and shows `Last checked: <timestamp>` (for example “Last checked 2 minutes ago”). It never claims “Live” unless a source was actually polled.
 
 Raw reviews are stored in local SQLite (`myntra_discovery.db`), which is gitignored. Collect after clone; do not commit the database.
 
-On Streamlit Cloud the filesystem is **ephemeral**. SQLite is available for the running session/demo and is wiped on reboot or redeploy. This app does not provide permanent cloud persistence.
+The dashboard shows **Storage: Local application storage**. On Streamlit Cloud the filesystem is **ephemeral**. SQLite is available for the running session and is wiped on reboot or redeploy. This app does not provide permanent historical continuity across restarts.
 
 ## AI Analysis
 
@@ -145,13 +152,17 @@ Analysis is cached by review content hash. Unchanged reviews are not sent to the
 
 ## Dashboard
 
-The dashboard includes Overview, Data Collection, Feedback Explorer, Wishlist Motivations, Purchase Barriers, Uncertainties, Root Causes, Themes, User Segments, Opportunity Matrix, Evidence Explorer, and Discovery Report.
+The Streamlit dashboard includes Overview (default **Last 30 Days**), Live Data, Latest Reviews, User Problems, Wishlist Behavior, Purchase Barriers, Uncertainties, Themes, User Segments, Opportunity Matrix, Evidence Explorer, Collection History, and Discovery Report.
+
+Period can be switched to **All Time**. Last-30-day metrics use review timestamps only.
 
 If nothing has been collected yet, the UI shows:
 
-`No data collected yet. Run the data collection pipeline.`
+`No reviews have been collected yet.`
 
-Every insight opens the original review text, source, URL, review ID, date, and classification. Quotes are never generated.
+plus **Collect Last 30 Days** and **Refresh Latest Reviews**.
+
+Every insight opens original review text, source, URL, review ID, review date, rating, region, and classification. Quotes are never generated.
 
 Default filter: **Myntra-valid evidence only**.
 

@@ -31,6 +31,13 @@ RSS_XML = (
 )
 MAX_RSS_PAGES = 10
 ATOM_NS = {"atom": "http://www.w3.org/2005/Atom", "im": "http://itunes.apple.com/rss"}
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, application/xml, text/xml, */*",
+}
 
 
 def _parse_dt(value: Any) -> datetime | None:
@@ -55,9 +62,13 @@ def _parse_dt(value: Any) -> datetime | None:
 
 
 def _label_from_entry(entry: dict[str, Any], key: str) -> str:
-    node = entry.get(key) or {}
+    node = entry.get(key)
+    if node is None:
+        return ""
+    if isinstance(node, list) and node:
+        node = node[0]
     if isinstance(node, dict):
-        return str(node.get("label") or "")
+        return str(node.get("label") or node.get("text") or "")
     return str(node or "")
 
 
@@ -83,7 +94,7 @@ class AppStoreCollector(BaseCollector):
     def _http(self) -> httpx.Client:
         if self._client is not None:
             return self._client
-        return httpx.Client(timeout=30.0, follow_redirects=True, headers={"User-Agent": "MyntraDiscoveryEngine/1.0"})
+        return httpx.Client(timeout=30.0, follow_redirects=True, headers=HTTP_HEADERS)
 
     def _get_json(self, url: str) -> dict[str, Any]:
         self.rate_limiter.wait()
@@ -265,15 +276,25 @@ class AppStoreCollector(BaseCollector):
             )
         return reviews
 
-    def _fetch_region_pages(self, region: str, limit: int, progress: ProgressCallback | None) -> list[dict[str, Any]]:
+    def _fetch_region_pages(
+        self,
+        region: str,
+        limit: int,
+        progress: ProgressCallback | None,
+        stop_when_older_than: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        from app.pipeline.dates import ensure_aware
+
         gathered: list[dict[str, Any]] = []
         seen: set[str] = set()
+        cutoff = ensure_aware(stop_when_older_than)
         app_id = self.settings.apple_app_id
         for page in range(1, MAX_RSS_PAGES + 1):
             if len(gathered) >= limit:
                 break
             url = RSS_JSON.format(region=region, page=page, app_id=app_id)
             page_rows: list[dict[str, Any]] = []
+            json_error: Exception | None = None
             try:
                 payload = with_retry(
                     lambda u=url: self._get_json(u),
@@ -282,16 +303,21 @@ class AppStoreCollector(BaseCollector):
                 )
                 page_rows = self._parse_json_feed(payload, region)
             except Exception as exc:
+                json_error = exc
                 logger.warning("JSON RSS failed %s page %s: %s — trying XML", region, page, exc)
+            if not page_rows:
                 try:
                     xml_text = with_retry(
-                        lambda: self._get_text(RSS_XML.format(region=region, page=page, app_id=app_id)),
+                        lambda p=page: self._get_text(RSS_XML.format(region=region, page=p, app_id=app_id)),
                         attempts=self.settings.collection_retry_attempts,
                         label=f"app-store rss xml {region} p{page}",
                     )
                     page_rows = self._parse_xml_feed(xml_text, region)
                 except Exception as xml_exc:
-                    self.errors.append(f"{region} page {page}: {xml_exc}")
+                    detail = f"{region} page {page}: {xml_exc}"
+                    if json_error:
+                        detail = f"{region} page {page}: json={json_error}; xml={xml_exc}"
+                    self.errors.append(detail)
                     if progress:
                         progress(
                             {
@@ -299,7 +325,7 @@ class AppStoreCollector(BaseCollector):
                                 "status": "error",
                                 "region": region,
                                 "page": page,
-                                "message": str(xml_exc),
+                                "message": detail,
                             }
                         )
                     break
@@ -307,6 +333,7 @@ class AppStoreCollector(BaseCollector):
             if not page_rows:
                 break
             new_on_page = 0
+            added_this_page: list[dict[str, Any]] = []
             for row in page_rows:
                 rid = str(row.get("id") or "")
                 if rid and rid in seen:
@@ -314,6 +341,7 @@ class AppStoreCollector(BaseCollector):
                 if rid:
                     seen.add(rid)
                 gathered.append(row)
+                added_this_page.append(row)
                 new_on_page += 1
                 if len(gathered) >= limit:
                     break
@@ -328,6 +356,14 @@ class AppStoreCollector(BaseCollector):
                         "target": limit,
                     }
                 )
+            if cutoff is not None and added_this_page:
+                dated = []
+                for row in added_this_page:
+                    stamp = ensure_aware(_parse_dt(row.get("updated")))
+                    if stamp is not None:
+                        dated.append(stamp)
+                if dated and all(stamp < cutoff for stamp in dated):
+                    break
             if new_on_page == 0:
                 break
         return gathered[:limit]
@@ -336,8 +372,16 @@ class AppStoreCollector(BaseCollector):
         self,
         max_reviews: int | None = None,
         progress: ProgressCallback | None = None,
+        *,
+        stop_when_older_than: datetime | None = None,
+        safety_limit: int | None = None,
     ) -> list[NormalizedReview]:
-        limit = max_reviews if max_reviews is not None else self.settings.apple_max_reviews
+        if safety_limit is not None:
+            limit = safety_limit
+        elif max_reviews is not None:
+            limit = max_reviews
+        else:
+            limit = self.settings.apple_max_reviews
         primary = self.settings.apple_primary_region
         fallback = self.settings.apple_fallback_region
 
@@ -376,7 +420,9 @@ class AppStoreCollector(BaseCollector):
                 )
             return []
 
-        raw_primary = self._fetch_region_pages(primary, limit, progress)
+        raw_primary = self._fetch_region_pages(
+            primary, limit, progress, stop_when_older_than=stop_when_older_than
+        )
         written_primary = [
             r for r in raw_primary if _has_written_body(str(r.get("title") or ""), str(r.get("content") or ""))
         ]
@@ -399,13 +445,23 @@ class AppStoreCollector(BaseCollector):
                     }
                 )
             fallback_validation = self.validate_source(progress=progress, region=fallback)
-            raw_fallback = self._fetch_region_pages(fallback, limit, progress)
+            raw_fallback = self._fetch_region_pages(
+                fallback, limit, progress, stop_when_older_than=stop_when_older_than
+            )
             raw_rows = raw_fallback
             validation = fallback_validation
             self.region_used = fallback
             self.fallback_used = True
 
         normalized = [self.normalize(row, validation) for row in raw_rows]
+        if not normalized and validation.is_valid_for_myntra:
+            msg = (
+                f"Apple App Store returned 0 written reviews for {app_id} "
+                f"(region={self.region_used}, fallback_used={self.fallback_used})."
+            )
+            logger.error(msg)
+            if msg not in self.errors:
+                self.errors.append(msg)
         if progress:
             progress(
                 {

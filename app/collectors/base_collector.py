@@ -157,6 +157,19 @@ class BaseCollector(ABC):
                 collection_run_id=collection_run_id,
             )
             db.add(row)
+            db.flush()
+            if item.is_valid_source:
+                from app.models import Analysis
+                from app.pipeline.analysis import ANALYSIS_VERSION
+
+                db.add(
+                    Analysis(
+                        review_id=row.id,
+                        content_hash=digest,
+                        status="pending",
+                        analysis_version=ANALYSIS_VERSION,
+                    )
+                )
             stats.new += 1
             if item.is_valid_source:
                 stats.valid += 1

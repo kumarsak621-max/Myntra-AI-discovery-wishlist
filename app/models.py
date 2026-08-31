@@ -61,6 +61,7 @@ class CollectionRun(Base):
     errors_json: Mapped[str] = mapped_column(Text, default="[]")
     duration_seconds: Mapped[float] = mapped_column(Float, default=0.0)
     notes: Mapped[str] = mapped_column(Text, default="")
+    mode: Mapped[str] = mapped_column(String(64), default="")
 
     reviews: Mapped[list["Review"]] = relationship(back_populates="collection_run")
 
@@ -139,6 +140,8 @@ class Analysis(Base):
     parse_error: Mapped[str] = mapped_column(Text, default="")
     is_valid_json: Mapped[bool] = mapped_column(Boolean, default=False)
     analyzed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    analysis_version: Mapped[str] = mapped_column(String(32), default="1")
 
     review: Mapped[Review] = relationship(back_populates="analysis")
 

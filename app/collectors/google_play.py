@@ -135,9 +135,20 @@ class GooglePlayCollector(BaseCollector):
         self,
         max_reviews: int | None = None,
         progress: ProgressCallback | None = None,
+        *,
+        stop_when_older_than: datetime | None = None,
+        safety_limit: int | None = None,
     ) -> list[NormalizedReview]:
+        from app.pipeline.dates import ensure_aware
+
         app_id = self.settings.google_play_app_id
-        limit = max_reviews if max_reviews is not None else self.settings.google_play_max_reviews
+        if safety_limit is not None:
+            limit = safety_limit
+        elif max_reviews is not None:
+            limit = max_reviews
+        else:
+            limit = self.settings.google_play_max_reviews
+        cutoff = ensure_aware(stop_when_older_than)
         batch = max(1, self.settings.google_play_batch_size)
         validation = self.validate_source(progress=progress)
         if is_banned_app_id(app_id) or not is_official_myntra_app_id(app_id, self.platform):
@@ -215,16 +226,25 @@ class GooglePlayCollector(BaseCollector):
                 break
 
             if not result:
+                if not collected:
+                    logger.warning("Google Play returned an empty review page for %s", app_id)
+                    self.errors.append(
+                        f"Google Play returned no review rows for {app_id} "
+                        f"(country={self.settings.google_play_country})."
+                    )
                 break
 
             new_on_page = 0
+            page_items: list[NormalizedReview] = []
             for raw in result:
                 review_id = str(raw.get("reviewId") or "")
                 if review_id and review_id in seen_ids:
                     continue
                 if review_id:
                     seen_ids.add(review_id)
-                collected.append(self.normalize(raw, validation))
+                item = self.normalize(raw, validation)
+                collected.append(item)
+                page_items.append(item)
                 new_on_page += 1
                 if len(collected) >= limit:
                     break
@@ -240,8 +260,22 @@ class GooglePlayCollector(BaseCollector):
                     }
                 )
 
+            if cutoff is not None and page_items:
+                dated = [r for r in page_items if r.review_date is not None]
+                if dated and all(ensure_aware(r.review_date) < cutoff for r in dated):
+                    break
+
             if new_on_page == 0 or continuation_token is None:
                 break
+
+        if not collected and validation.is_valid_for_myntra:
+            msg = (
+                f"Google Play returned 0 public reviews for {app_id}. "
+                "The store may be blocking this host, or the request failed."
+            )
+            logger.error(msg)
+            if msg not in self.errors:
+                self.errors.append(msg)
 
         if progress:
             progress(
