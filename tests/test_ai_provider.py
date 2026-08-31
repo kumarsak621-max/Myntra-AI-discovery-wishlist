@@ -193,6 +193,59 @@ def test_connection_test_success(monkeypatch):
     assert "unit-test-key" not in str(result)
 
 
+def test_reuses_same_client_across_calls(monkeypatch):
+    created: list[FakeClient] = []
+
+    def make(self):
+        client = FakeClient(
+            [
+                FakeResponse('{"relevance":"none"}'),
+                FakeResponse('{"relevance":"low"}'),
+            ]
+        )
+        created.append(client)
+        return client
+
+    monkeypatch.setattr(GeminiAIService, "_client", make)
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    provider = _provider()
+    first = provider.complete_json(system="s", user="batch-1")
+    second = provider.complete_json(system="s", user="batch-2")
+    assert "none" in first
+    assert "low" in second
+    assert len(created) == 1
+    assert len(created[0].models.calls) == 2
+
+
+def test_closed_client_is_replaced_then_retried(monkeypatch):
+    created: list[int] = []
+
+    class ClosedThenOk:
+        def __init__(self, index: int) -> None:
+            self.index = index
+            self.models = self
+            self.calls: list[str] = []
+
+        def generate_content(self, model, contents, config=None):
+            self.calls.append(contents)
+            if self.index == 1:
+                raise RuntimeError("Cannot send a request, as the client has been closed.")
+            return FakeResponse('{"relevance":"none"}')
+
+        def close(self) -> None:
+            return None
+
+    def make(self):
+        created.append(1)
+        return ClosedThenOk(len(created))
+
+    monkeypatch.setattr(GeminiAIService, "_client", make)
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    text = _provider().complete_json(system="s", user="u")
+    assert "relevance" in text
+    assert len(created) == 2
+
+
 def test_missing_key_does_not_call_gemini(monkeypatch):
     called = {"n": 0}
 

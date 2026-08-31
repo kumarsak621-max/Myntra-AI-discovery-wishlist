@@ -569,18 +569,17 @@ def _diagnostics() -> None:
 
 
 def _render_gemini_probe(probe: dict) -> None:
+    connected = bool(probe.get("ok") and probe.get("status") in {"SUCCESS", "Connected"})
     st.subheader("GEMINI CONNECTION TEST")
-    st.write("AI Provider:")
+    st.write("Provider:")
     st.write(probe.get("provider") or "Google Gemini")
     st.write("Model:")
     st.write(probe.get("model") or "")
-    st.write("API Key:")
-    st.write(probe.get("credentials") or "Missing")
-    st.write("Connection:")
-    st.write(probe.get("status") or "FAILED")
+    st.write("Status:")
+    st.write("Connected" if connected else "Failed")
     st.write("Error:")
     st.write(probe.get("error") or "None")
-    if probe.get("ok") and probe.get("status") == "SUCCESS":
+    if connected:
         st.success("Gemini accepted a live test request.")
     else:
         st.error(probe.get("error") or "Gemini connection test failed.")
@@ -592,23 +591,37 @@ def _ai_analysis_status_panel(ai_ok: bool) -> None:
     reload_settings()
     ai = get_ai_diagnostics()
     key_label = "Configured" if ai.get("api_key_configured") == "YES" else "Missing"
+    probe = st.session_state.get("ai_connection_test") or {}
+    last_ai = st.session_state.get("last_analysis") or {}
+    if probe.get("ok") and probe.get("status") in {"SUCCESS", "Connected"}:
+        gemini_status = "Connected"
+    elif last_ai.get("status") == "Connected":
+        gemini_status = "Connected"
+    elif probe or ai.get("last_error") or last_ai.get("status") == "Failed":
+        gemini_status = "Failed"
+    else:
+        gemini_status = "Not tested"
     st.subheader("AI ANALYSIS STATUS")
+    st.write("Reviews stored:")
+    st.write(ai.get("myntra_reviews") if ai.get("myntra_reviews") is not None else ai.get("total_reviews"))
+    st.write("Pending analysis:")
+    st.write(ai.get("pending_reviews"))
+    st.write("Analyzed:")
+    st.write(ai.get("analyzed_reviews"))
+    st.write("Failed:")
+    st.write(ai.get("failed_reviews"))
+    st.write("Gemini status:")
+    st.write(gemini_status)
+    st.write("Last analysis:")
+    st.write(ai.get("last_successful_analysis") or "None")
+    st.write("Last analysis error:")
+    st.write(ai.get("last_error") or "None")
     st.write("AI PROVIDER")
     st.write(ai.get("ai_provider") or "Google Gemini")
     st.write("MODEL")
     st.write(ai.get("ai_model") or "gemini-2.5-flash")
     st.write("API KEY")
     st.write(key_label)
-    st.write("PENDING")
-    st.write(ai.get("pending_reviews"))
-    st.write("ANALYZED")
-    st.write(ai.get("analyzed_reviews"))
-    st.write("FAILED")
-    st.write(ai.get("failed_reviews"))
-    st.write("LAST SUCCESSFUL ANALYSIS")
-    st.write(ai.get("last_successful_analysis") or "None")
-    st.write("LAST ERROR")
-    st.write(ai.get("last_error") or "None")
     st.caption("API key is never displayed.")
 
     test_col, analyze_col = st.columns(2)
@@ -823,7 +836,10 @@ def _run_full_discovery(ai_ok: bool) -> None:
             if result.analyzed:
                 box.update(label="Discovery pipeline complete", state="complete")
             else:
-                box.update(label="Collection saved — analysis needs Gemini (see Live Data)", state="error")
+                box.update(label="Reviews collected successfully, but AI analysis failed.", state="error")
+                st.error("Reviews collected successfully, but AI analysis failed.")
+                if result.last_error:
+                    st.error(result.last_error)
             st.session_state["last_analysis"] = {
                 "status": "Connected" if result.analyzed else ("Failed" if result.failed or result.last_error else "Configured"),
                 "message": (
@@ -890,6 +906,8 @@ def _run_collect(sources: list[str], analyze: bool, mode: str = "latest") -> Non
         }
         if analyze:
             if stats.analysis_error and stats.analyzed == 0:
+                st.error("Reviews collected successfully, but AI analysis failed.")
+                st.error(stats.analysis_error)
                 st.session_state["last_analysis"] = {"status": "Failed", "message": stats.analysis_error}
             else:
                 st.session_state["last_analysis"] = {

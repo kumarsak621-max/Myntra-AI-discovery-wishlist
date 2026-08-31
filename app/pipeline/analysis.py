@@ -278,43 +278,48 @@ def analyze_new_reviews(
     max_chars = int(getattr(settings, "ai_max_review_chars", 4000) or 4000)
     processed = 0
 
-    for chunk in _chunks(pending, batch_size):
-        if rate > 0:
-            time.sleep(rate)
-        analyzed, failed, error, http_status = _analyze_batch(db, provider, chunk, max_chars=max_chars)
-        result.analyzed += analyzed
-        result.failed += failed
-        result.processed += len(chunk)
-        processed += len(chunk)
-        if error:
-            result.last_error = error
-        if http_status:
-            result.last_http_status = http_status
+    try:
+        for chunk in _chunks(pending, batch_size):
+            if rate > 0:
+                time.sleep(rate)
+            analyzed, failed, error, http_status = _analyze_batch(db, provider, chunk, max_chars=max_chars)
+            result.analyzed += analyzed
+            result.failed += failed
+            result.processed += len(chunk)
+            processed += len(chunk)
+            if error:
+                result.last_error = error
+            if http_status:
+                result.last_http_status = http_status
+            db.commit()
+            if progress:
+                progress(
+                    {
+                        "stage": "analysis",
+                        "status": "progress",
+                        "analyzed": result.analyzed,
+                        "failed": result.failed,
+                        "processed": processed,
+                        "total": len(pending),
+                        "message": error,
+                    }
+                )
+
         db.commit()
         if progress:
+            status = "complete" if result.analyzed else ("error" if result.failed else "complete")
             progress(
                 {
                     "stage": "analysis",
-                    "status": "progress",
+                    "status": status,
                     "analyzed": result.analyzed,
                     "failed": result.failed,
-                    "processed": processed,
                     "total": len(pending),
-                    "message": error,
+                    "message": result.last_error,
                 }
             )
-
-    db.commit()
-    if progress:
-        status = "complete" if result.analyzed else ("error" if result.failed else "complete")
-        progress(
-            {
-                "stage": "analysis",
-                "status": status,
-                "analyzed": result.analyzed,
-                "failed": result.failed,
-                "total": len(pending),
-                "message": result.last_error,
-            }
-        )
-    return result
+        return result
+    finally:
+        closer = getattr(provider, "close", None)
+        if callable(closer):
+            closer()
