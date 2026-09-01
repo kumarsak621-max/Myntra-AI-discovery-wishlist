@@ -4,6 +4,7 @@ import httpx
 
 from app.ai.provider import (
     AIError,
+    AUTH_401_MESSAGE,
     OpenRouterAIService,
     QUOTA_MESSAGE,
 )
@@ -140,7 +141,8 @@ def test_401_is_not_retried(monkeypatch):
         _provider().complete_json(system="s", user="u")
         raise AssertionError("should have failed")
     except AIError as exc:
-        assert "401" in str(exc) or "API key" in str(exc)
+        assert str(exc) == AUTH_401_MESSAGE
+        assert exc.http_status == 401
         assert "unit-test-key" not in str(exc)
     assert len(client.calls) == 1
 
@@ -250,3 +252,40 @@ def test_400_includes_openrouter_error_body(monkeypatch):
         assert exc.http_status == 400
         assert "400" in str(exc)
         assert "Provider returned error" in str(exc)
+
+
+def test_quoted_secret_is_stripped_from_authorization(monkeypatch):
+    client = FakeClient(
+        [
+            FakeResponse(
+                200,
+                payload={"choices": [{"message": {"content": '{"relevance":"none"}'}}]},
+            )
+        ]
+    )
+    monkeypatch.setattr("httpx.Client", lambda *a, **k: client)
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    _provider(openrouter_api_key='  "sk-or-v1-quotedtest"  ').complete_json(system="s", user="u")
+    auth = client.calls[0]["headers"]["Authorization"]
+    assert auth == "Bearer sk-or-v1-quotedtest"
+    assert auth.count("Bearer") == 1
+    assert '"' not in auth
+    assert client.calls[0]["url"].endswith("/chat/completions")
+    assert "generativelanguage.googleapis.com" not in client.calls[0]["url"]
+
+
+def test_gemini_style_key_is_rejected_before_http(monkeypatch):
+    called = {"n": 0}
+
+    def boom(*a, **k):
+        called["n"] += 1
+        raise AssertionError("must not call OpenRouter with a Gemini key")
+
+    monkeypatch.setattr("httpx.Client", boom)
+    try:
+        _provider(openrouter_api_key="AIzaSyDummyGeminiKey").complete_json(system="s", user="u")
+        raise AssertionError("should have failed")
+    except AIError as exc:
+        assert "sk-or-" in str(exc)
+        assert "AIza" not in str(exc)
+    assert called["n"] == 0

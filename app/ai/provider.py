@@ -10,7 +10,29 @@ from typing import Any
 import httpx
 
 from app.config import Settings, get_settings
-from config.settings import normalize_openrouter_model
+from config.settings import (
+    normalize_openrouter_api_key,
+    normalize_openrouter_model,
+    resolve_openrouter_credentials,
+)
+
+logger = logging.getLogger(__name__)
+
+QUOTA_MESSAGE = "OpenRouter rate limit reached. Please try again later."
+MISSING_KEY_MESSAGE = (
+    "OpenRouter API key is not configured. "
+    "Add OPENROUTER_API_KEY to Streamlit Secrets or .env."
+)
+AUTH_401_MESSAGE = (
+    "OpenRouter authentication failed (HTTP 401). "
+    "The key was found, but OpenRouter rejected the credential. "
+    "Create/check the OpenRouter API key in Streamlit Secrets."
+)
+GEMINI_KEY_MESSAGE = (
+    "OPENROUTER_API_KEY looks like a Google Gemini key, not an OpenRouter key. "
+    "Use an OpenRouter key that starts with sk-or- in Streamlit Secrets."
+)
+OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 logger = logging.getLogger(__name__)
 
@@ -86,18 +108,38 @@ class OpenRouterAIService:
     @property
     def _endpoint(self) -> str:
         base = (self.settings.openrouter_base_url or "https://openrouter.ai/api/v1").rstrip("/")
+        if "generativelanguage.googleapis.com" in base:
+            return OPENROUTER_CHAT_URL
         return f"{base}/chat/completions"
 
+    def _api_key(self) -> str:
+        live = resolve_openrouter_credentials()
+        if live.get("source") == "Streamlit Secrets" and live.get("key"):
+            key = live["key"]
+        else:
+            key = normalize_openrouter_api_key(self.settings.openrouter_api_key) or live.get("key") or ""
+        if key.startswith("AIza"):
+            raise AIError(GEMINI_KEY_MESSAGE)
+        return key
+
     def available(self) -> bool:
-        return bool((self.settings.openrouter_api_key or "").strip())
+        try:
+            return bool(self._api_key())
+        except AIError:
+            return False
 
     def close(self) -> None:
         """No persistent HTTP client; present for pipeline finally-blocks."""
         return None
 
     def _headers(self) -> dict[str, str]:
+        key = self._api_key()
+        if not key:
+            raise AIError(MISSING_KEY_MESSAGE)
+        if key.lower().startswith("bearer "):
+            key = key[7:].strip()
         return {
-            "Authorization": f"Bearer {self.settings.openrouter_api_key}",
+            "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
             "HTTP-Referer": "https://github.com/kumarsak621-max/Myntra-AI-discovery-wishlist",
             "X-Title": "Myntra AI Discovery Engine",
@@ -108,7 +150,7 @@ class OpenRouterAIService:
         return httpx.Timeout(seconds, connect=min(15.0, seconds))
 
     def complete_json(self, *, system: str, user: str) -> str:
-        if not self.available():
+        if not self._api_key():
             raise AIError(MISSING_KEY_MESSAGE)
         last_error: AIError | None = None
         attempts = max(1, int(self.settings.ai_retry_attempts or 5))
@@ -209,15 +251,17 @@ def _openrouter_error_text(response: httpx.Response) -> str:
 def _content_from_response(response: httpx.Response) -> str:
     status = response.status_code
     snippet = _openrouter_error_text(response)
-    if status == 401 or status == 403:
+    if status == 401:
+        raise AIError(AUTH_401_MESSAGE, http_status=401)
+    if status == 403:
         raise AIError(
-            f"OpenRouter analysis failed: API key/configuration issue (HTTP {status}). "
-            "Check OPENROUTER_API_KEY in Streamlit Secrets or .env.",
-            http_status=status,
+            "OpenRouter authentication failed (HTTP 403). "
+            "The key was found, but OpenRouter rejected access to this resource.",
+            http_status=403,
         )
     if status == 404:
         raise AIError(
-            f"OpenRouter analysis failed: model unavailable (HTTP 404). "
+            f"Configured model/endpoint unavailable (HTTP 404). "
             f"{snippet or 'Set OPENROUTER_MODEL to a model your OpenRouter account can use.'}",
             http_status=404,
         )
@@ -225,13 +269,13 @@ def _content_from_response(response: httpx.Response) -> str:
         raise AIError(QUOTA_MESSAGE, retryable=True, http_status=429)
     if status in {500, 502, 503, 504}:
         raise AIError(
-            f"OpenRouter analysis failed: provider/server error HTTP {status}. Retrying.",
+            f"OpenRouter/provider server error (HTTP {status}). Retrying.",
             retryable=True,
             http_status=status,
         )
     if status == 400:
         raise AIError(
-            f"OpenRouter analysis failed: invalid request (HTTP 400). {snippet or 'request failed'}",
+            f"Invalid OpenRouter request (HTTP 400). {snippet or 'request failed'}",
             http_status=400,
         )
     if status >= 400:
@@ -275,19 +319,32 @@ def test_openrouter_connection(settings: Settings | None = None) -> dict[str, An
     from config.settings import reload_settings
 
     settings = settings or reload_settings()
+    creds = resolve_openrouter_credentials()
+    key = creds["key"] or normalize_openrouter_api_key(settings.openrouter_api_key)
     model = normalize_openrouter_model(settings.openrouter_model or settings.resolved_model)
-    configured = bool((settings.openrouter_api_key or "").strip())
+    configured = bool(key)
     result: dict[str, Any] = {
         "provider": "OpenRouter",
         "model": model,
         "credentials": "Configured" if configured else "Missing",
+        "secret_source": creds["source"] if creds["key"] else ("Environment" if configured else "Missing"),
+        "key_format": creds["key_format"] if creds["key"] else (
+            "VALID PREFIX" if key.startswith("sk-or-") else ("INVALID PREFIX" if key else "MISSING")
+        ),
+        "key_prefix": creds["key_prefix"] if creds["key"] else ("sk-or-v1-..." if key.startswith("sk-or-v1-") else "none"),
         "ok": False,
         "status": "FAILED",
         "http_status": None,
         "error": None,
+        "endpoint": OPENROUTER_CHAT_URL,
     }
     if not configured:
         result["error"] = MISSING_KEY_MESSAGE
+        return result
+    if key.startswith("AIza"):
+        result["error"] = GEMINI_KEY_MESSAGE
+        result["key_format"] = "INVALID PREFIX"
+        result["key_prefix"] = "gemini-style (invalid for OpenRouter)"
         return result
 
     service = OpenRouterAIService(settings)

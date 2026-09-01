@@ -5,6 +5,8 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 import logging
+import os
+import re
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -36,6 +38,44 @@ def normalize_openrouter_model(value: str | None) -> str:
     if "/" not in text and text.lower().startswith("gemini"):
         text = f"google/{text}"
     return text.strip() or DEFAULT_OPENROUTER_MODEL
+
+
+def normalize_openrouter_api_key(value: str | None) -> str:
+    """Strip whitespace, wrapping quotes, and accidental Bearer prefixes. Never log the result."""
+    text = str(value or "")
+    for ch in ("\ufeff", "\u200b", "\u200c", "\u200d", "\r"):
+        text = text.replace(ch, "")
+    text = text.strip()
+    if text.lower().startswith("openrouter_api_key="):
+        text = text.split("=", 1)[1].strip()
+    while len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'", "`"}:
+        text = text[1:-1].strip()
+    if text.lower().startswith("bearer "):
+        text = text[7:].strip()
+        while len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'", "`"}:
+            text = text[1:-1].strip()
+    text = re.sub(r"\s+", "", text)
+    return text
+
+
+def openrouter_key_prefix_status(key: str) -> str:
+    if not key:
+        return "MISSING"
+    if key.startswith("sk-or-"):
+        return "VALID PREFIX"
+    return "INVALID PREFIX"
+
+
+def openrouter_key_prefix_mask(key: str) -> str:
+    if not key:
+        return "none"
+    if key.startswith("sk-or-v1-"):
+        return "sk-or-v1-..."
+    if key.startswith("sk-or-"):
+        return "sk-or-..."
+    if key.startswith("AIza"):
+        return "gemini-style (invalid for OpenRouter)"
+    return "unrecognized"
 
 
 class Settings(BaseSettings):
@@ -102,7 +142,7 @@ class Settings(BaseSettings):
 
     @property
     def has_ai_credentials(self) -> bool:
-        return bool((self.openrouter_api_key or "").strip())
+        return bool(normalize_openrouter_api_key(self.openrouter_api_key))
 
     @property
     def google_play_url(self) -> str:
@@ -125,17 +165,47 @@ def _streamlit_secret(name: str) -> str | None:
 
         if get_script_run_ctx() is None:
             return None
-        if name not in st.secrets:
-            return None
-        value = st.secrets.get(name)
+        try:
+            value = st.secrets.get(name)
+        except Exception:
+            value = None
         if value is None:
             return None
-        text = str(value).strip()
+        text = normalize_openrouter_api_key(str(value)) if name.endswith("API_KEY") else str(value).strip()
         return text or None
     except Exception:
         logger = logging.getLogger(__name__)
         logger.debug("Streamlit secrets are not available in this process")
         return None
+
+
+def resolve_openrouter_credentials() -> dict:
+    """Fresh read: Streamlit Secrets, then environment/.env. Includes the key for HTTP only."""
+    source = "Missing"
+    raw = ""
+    secret = _streamlit_secret("OPENROUTER_API_KEY")
+    if secret:
+        source = "Streamlit Secrets"
+        raw = secret
+    else:
+        env_raw = os.getenv("OPENROUTER_API_KEY")
+        if normalize_openrouter_api_key(env_raw):
+            source = "Environment"
+            raw = env_raw or ""
+        else:
+            file_key = _dotenv_file_values().get("OPENROUTER_API_KEY") or ""
+            if normalize_openrouter_api_key(file_key):
+                source = "Environment"
+                raw = file_key
+    key = normalize_openrouter_api_key(raw)
+    return {
+        "key": key,
+        "source": source if key else "Missing",
+        "configured": bool(key),
+        "key_format": openrouter_key_prefix_status(key),
+        "key_prefix": openrouter_key_prefix_mask(key),
+        "looks_like_gemini": key.startswith("AIza"),
+    }
 
 
 def _dotenv_file_values() -> dict[str, str]:
@@ -150,11 +220,11 @@ def _dotenv_file_values() -> dict[str, str]:
 
 
 @lru_cache
-def get_settings() -> Settings:
+def _env_settings() -> Settings:
     settings = Settings()
     file_vals = _dotenv_file_values()
-    if not (settings.openrouter_api_key or "").strip():
-        file_key = file_vals.get("OPENROUTER_API_KEY") or ""
+    if not normalize_openrouter_api_key(settings.openrouter_api_key):
+        file_key = normalize_openrouter_api_key(file_vals.get("OPENROUTER_API_KEY"))
         if file_key:
             settings.openrouter_api_key = file_key
     if not (settings.openrouter_model or "").strip():
@@ -162,10 +232,20 @@ def get_settings() -> Settings:
         if file_model:
             settings.openrouter_model = file_model
             settings.ai_model = file_model
-    secret_key = _streamlit_secret("OPENROUTER_API_KEY")
+    settings.openrouter_api_key = normalize_openrouter_api_key(settings.openrouter_api_key)
+    settings.ai_provider = "openrouter"
+    return settings
+
+
+def get_settings() -> Settings:
+    """Env/file base settings, then a fresh Streamlit Secrets overlay for the API key."""
+    settings = _env_settings()
+    creds = resolve_openrouter_credentials()
+    if creds["key"]:
+        settings.openrouter_api_key = creds["key"]
+    else:
+        settings.openrouter_api_key = normalize_openrouter_api_key(settings.openrouter_api_key)
     secret_model = _streamlit_secret("OPENROUTER_MODEL")
-    if secret_key:
-        settings.openrouter_api_key = secret_key
     if secret_model:
         settings.openrouter_model = secret_model
         settings.ai_model = secret_model
@@ -173,14 +253,30 @@ def get_settings() -> Settings:
     return settings
 
 
+get_settings.cache_clear = _env_settings.cache_clear  # type: ignore[method-assign]
+
+
 def get_ai_config() -> dict:
-    """Streamlit Secrets overlay .env. Never return the API key to callers that render UI."""
+    """Safe diagnostics for the UI. Never includes the API key."""
+    reload_settings()
     settings = get_settings()
+    creds = resolve_openrouter_credentials()
+    if not creds["configured"]:
+        creds = {
+            **creds,
+            "configured": bool(settings.openrouter_api_key),
+            "source": creds["source"] if not settings.openrouter_api_key else "Environment",
+            "key_format": openrouter_key_prefix_status(settings.openrouter_api_key),
+            "key_prefix": openrouter_key_prefix_mask(settings.openrouter_api_key),
+        }
     return {
         "provider": "openrouter",
         "provider_label": "OpenRouter",
         "model": settings.resolved_model,
-        "configured": bool((settings.openrouter_api_key or "").strip()),
+        "configured": bool(creds.get("configured") or settings.openrouter_api_key),
+        "secret_source": creds.get("source") or "Missing",
+        "key_format": creds.get("key_format") or "MISSING",
+        "key_prefix": creds.get("key_prefix") or "none",
         "missing_key_message": (
             "OpenRouter API key is not configured. "
             "Add OPENROUTER_API_KEY to Streamlit Secrets or .env."
@@ -189,7 +285,7 @@ def get_ai_config() -> dict:
 
 
 def reload_settings() -> Settings:
-    get_settings.cache_clear()
+    _env_settings.cache_clear()
     return get_settings()
 
 

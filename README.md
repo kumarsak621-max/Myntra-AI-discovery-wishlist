@@ -233,9 +233,11 @@ Default filter: **Myntra-valid evidence only**.
 6. Add Streamlit Secrets (App settings → Secrets) in TOML:
 
 ```toml
-OPENROUTER_API_KEY = "YOUR_OPENROUTER_API_KEY"
+OPENROUTER_API_KEY = "your_openrouter_key"
 OPENROUTER_MODEL = "google/gemini-2.5-flash"
 ```
+
+Use a real OpenRouter key that starts with `sk-or-v1-`. Do not paste a Google Gemini `AIza...` key. Do not wrap the key in extra quotes inside the value. After saving secrets, click **Test OpenRouter Connection**. "API KEY Configured" only means a value exists; HTTP 401 means OpenRouter rejected that credential.
 
 7. Deploy.
 

@@ -49,13 +49,16 @@ def _request_batch_size(settings) -> int:
 
 
 def smoke_test_analyze_limit(db: Session, settings) -> int:
-    """First successful analysis run is capped at 5 real reviews."""
+    """First run: 1 review. Next runs until 6 analyzed: 5. Then the configured cap."""
     from app.database import get_database_diagnostics
 
     configured = int(getattr(settings, "ai_analysis_batch_size", 60) or 60)
     configured = max(1, configured)
     diag = get_database_diagnostics(db)
-    if int(diag.get("analyzed_reviews") or 0) == 0:
+    analyzed = int(diag.get("analyzed_reviews") or 0)
+    if analyzed == 0:
+        return 1
+    if analyzed < 6:
         return min(configured, 5)
     return configured
 

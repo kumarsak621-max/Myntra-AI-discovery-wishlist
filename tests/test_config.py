@@ -8,6 +8,7 @@ from config.settings import (
     Settings,
     _streamlit_secret,
     get_settings,
+    normalize_openrouter_api_key,
     normalize_openrouter_model,
     reload_settings,
 )
@@ -76,11 +77,30 @@ def test_get_ai_config_never_returns_key():
     assert "openrouter_api_key" not in cfg
     assert "api_key" not in cfg
     dumped = str(cfg)
-    assert "sk-or-" not in dumped
-    assert "AIza" not in dumped
+    assert "openrouter_api_key" not in cfg
+    assert "api_key" not in cfg
+    assert "sk-or-v1-" not in dumped or cfg.get("key_prefix") in {
+        "sk-or-v1-...",
+        "sk-or-...",
+        "none",
+        "unrecognized",
+        "gemini-style (invalid for OpenRouter)",
+        "MISSING",
+    }
+    import re as _re
+
+    assert not _re.search(r"sk-or-v1-[A-Za-z0-9]{8,}", dumped)
+    assert "AIzaSy" not in dumped
     if not cfg["configured"]:
         assert "OPENROUTER_API_KEY" in cfg["missing_key_message"]
         assert "Gemini" not in cfg["missing_key_message"]
+
+
+def test_normalize_strips_quotes_and_bearer():
+    assert normalize_openrouter_api_key('  "sk-or-v1-abc"  ') == "sk-or-v1-abc"
+    assert normalize_openrouter_api_key("Bearer sk-or-v1-abc") == "sk-or-v1-abc"
+    assert normalize_openrouter_api_key("'sk-or-v1-abc'") == "sk-or-v1-abc"
+    assert normalize_openrouter_api_key('OPENROUTER_API_KEY="sk-or-v1-abc"') == "sk-or-v1-abc"
 
 
 def test_file_key_used_when_process_env_empty(monkeypatch):

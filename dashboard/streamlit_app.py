@@ -579,17 +579,32 @@ def _diagnostics() -> None:
 
 def _render_ai_probe(probe: dict) -> None:
     connected = bool(probe.get("ok") and probe.get("status") in {"SUCCESS", "Connected"})
+    http_status = probe.get("http_status")
     st.subheader("AI CONNECTION TEST")
-    st.write("AI Provider:")
+    st.write("Provider:")
     st.write(probe.get("provider") or "OpenRouter")
     st.write("Model:")
     st.write(probe.get("model") or "")
-    st.write("API Status:")
-    st.write("Connected" if connected else "Failed")
+    st.write("Secret source:")
+    st.write(probe.get("secret_source") or "Missing")
+    st.write("Key configured:")
+    st.write("YES" if probe.get("credentials") == "Configured" else "NO")
+    st.write("Key format:")
+    st.write(probe.get("key_format") or "MISSING")
+    st.write("Key prefix:")
+    st.write(probe.get("key_prefix") or "none")
+    st.write("Connection:")
+    if connected:
+        st.write("PASS")
+    elif http_status:
+        st.write(f"FAIL — HTTP {http_status}")
+    else:
+        st.write("FAIL")
     st.write("HTTP status:")
-    st.write(probe.get("http_status") if probe.get("http_status") is not None else "N/A")
+    st.write(http_status if http_status is not None else "N/A")
     st.write("Error:")
     st.write(probe.get("error") or "None")
+    st.caption("The full API key is never displayed.")
     if connected:
         st.success("OpenRouter accepted a live test request.")
     else:
@@ -605,12 +620,11 @@ def _ai_analysis_status_panel(ai_ok: bool) -> None:
     cfg = get_ai_config()
     key_label = "Configured" if cfg["configured"] else "Missing"
     probe = st.session_state.get("ai_connection_test") or {}
-    last_ai = st.session_state.get("last_analysis") or {}
     if probe.get("ok") and probe.get("status") in {"SUCCESS", "Connected"}:
         connection = "Connected"
-    elif last_ai.get("status") == "Connected":
-        connection = "Connected"
-    elif probe or ai.get("last_error") or last_ai.get("status") == "Failed":
+    elif probe.get("http_status"):
+        connection = f"Failed — HTTP {probe.get('http_status')}"
+    elif probe:
         connection = "Failed"
     else:
         connection = "Not tested"
@@ -633,7 +647,13 @@ def _ai_analysis_status_panel(ai_ok: bool) -> None:
     st.write(ai.get("last_error") or "None")
     st.write("API KEY")
     st.write(key_label)
-    st.caption("API key is never displayed.")
+    st.write("Key format:")
+    st.write(cfg.get("key_format") or "MISSING")
+    st.write("Secret source:")
+    st.write(cfg.get("secret_source") or "Missing")
+    st.write("Connection")
+    st.write(connection)
+    st.caption("Configured means a secret value exists. Connection is a real OpenRouter request.")
 
     test_col, analyze_col, retry_col = st.columns(3)
     with test_col:
