@@ -20,11 +20,14 @@ def _settings(**kwargs) -> Settings:
         "openrouter_model": "google/gemini-2.5-flash",
         "ai_rate_limit_seconds": 0,
         "ai_request_batch_size": 2,
+        "ai_batch_size": 2,
         "ai_retry_attempts": 2,
         "ai_analysis_batch_size": 60,
-        "ai_request_batch_size": 2,
+        "ai_max_tokens": 2000,
     }
     values.update(kwargs)
+    if "ai_request_batch_size" in values and "ai_batch_size" not in kwargs:
+        values["ai_batch_size"] = values["ai_request_batch_size"]
     return Settings(**values)
 
 
@@ -84,6 +87,7 @@ class FakeProvider:
         self.settings = settings or _settings()
         self._complete = complete
         self.calls: list[str] = []
+        self.last_usage: dict = {}
 
     @property
     def provider_name(self) -> str:
@@ -210,6 +214,24 @@ def test_only_failed_skips_pending(db):
     assert failed.id in {r.id for r in reviews_needing_analysis(db, only_failed=True)}
     assert failed.id not in {r.id for r in reviews_needing_analysis(db, include_failed=False)}
     assert pending.id in {r.id for r in reviews_needing_analysis(db, include_failed=False)}
+
+
+def test_http_402_leaves_reviews_pending(db):
+    from app.ai.provider import CREDIT_402_MESSAGE
+
+    row = _insert(db, "credit-limit", "Wishlisted a dress but the size chart is missing.")
+    db.commit()
+
+    def complete(*, system, user):
+        raise AIError(CREDIT_402_MESSAGE, http_status=402)
+
+    result = analyze_new_reviews(db, provider=FakeProvider(complete, _settings()), limit=1)
+    db.commit()
+    assert result.analyzed == 0
+    assert result.failed == 0
+    assert result.last_http_status == 402
+    assert "credits" in (result.last_error or "").lower() or "max_tokens" in (result.last_error or "").lower()
+    assert row.analysis.status == "pending"
 
 
 def test_insights_are_blocked_when_analysis_fails(db, monkeypatch):

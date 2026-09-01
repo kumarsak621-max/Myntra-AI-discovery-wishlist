@@ -30,6 +30,7 @@ build/
 *.egg-info/
 
 *.log
+logs/
 
 data/raw/
 data/private/

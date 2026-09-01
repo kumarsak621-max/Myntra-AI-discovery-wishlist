@@ -41,6 +41,7 @@ from config.settings import (
     OFFICIAL_GOOGLE_PLAY_APP_ID,
     OFFICIAL_GOOGLE_PLAY_APP_NAME,
     OFFICIAL_GOOGLE_PLAY_URL,
+    clamp_max_dataset_reviews,
     get_settings,
     reload_settings,
 )
@@ -63,7 +64,7 @@ PAGES = [
     "Discovery Report",
 ]
 
-EMPTY = "No reviews have been collected yet."
+EMPTY = "No real reviews available for analysis."
 NEAR_REALTIME = "Near-real-time — refreshed from the public source"
 
 
@@ -126,6 +127,10 @@ def _safe_error(exc: Exception) -> None:
         st.code(traceback.format_exc())
 
 
+def _dataset_limit() -> int:
+    return clamp_max_dataset_reviews(get_settings().max_dataset_reviews)
+
+
 def _empty_notice(count: int, *, need_analysis: bool = False) -> bool:
     if count == 0:
         st.info(EMPTY)
@@ -166,12 +171,12 @@ def render() -> None:
         st.session_state["analyze_on_collect"] = bool(ai_ok)
     cutoff = _period_since()
     stored_all = get_review_count(myntra_only=myntra_only)
+    last_30 = get_review_count(since=get_last_30_days_cutoff(), myntra_only=myntra_only)
+    limit = _dataset_limit()
     st.sidebar.markdown("**Stored reviews**")
     st.sidebar.write("All time:", stored_all)
-    st.sidebar.write(
-        "Last 30 days:",
-        get_review_count(since=get_last_30_days_cutoff(), myntra_only=myntra_only),
-    )
+    st.sidebar.write("Dataset limit:", limit)
+    st.sidebar.write("Last 30 days:", last_30)
     st.sidebar.markdown("**AI**")
     st.sidebar.write("API key:", "Configured" if ai_ok else "Missing")
     st.sidebar.write("Model:", settings.resolved_model)
@@ -284,17 +289,18 @@ def _overview(myntra_only: bool, ai_ok: bool) -> None:
 
     last = st.session_state.get("last_collection") or {}
     new_since = (last.get("stats") or {}).get("new", 0)
+    limit = _dataset_limit()
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total reviews", count)
-    c2.metric("New reviews (last sync)", new_since)
-    c3.metric("Average rating", data.get("average_rating") if data.get("average_rating") is not None else "—")
-    c4.metric("Wishlist signals", data.get("wishlist_signals", 0))
-    d1, d2, d3, d4 = st.columns(4)
+    c2.metric("Dataset limit", limit)
+    c3.metric("New reviews (last sync)", new_since)
+    c4.metric("Average rating", data.get("average_rating") if data.get("average_rating") is not None else "—")
+    d0, d1, d2, d3, d4 = st.columns(5)
+    d0.metric("Wishlist signals", data.get("wishlist_signals", 0))
     d1.metric("Google Play", data.get("google_play_reviews", 0))
     d2.metric("Apple App Store", data.get("apple_reviews", 0))
     d3.metric("Purchase barriers (analyzed)", data.get("purchase_hesitation", 0))
-    top_opp = (data.get("opportunity_count") or 0)
-    d4.metric("Opportunity areas", top_opp)
+    d4.metric("Opportunity areas", data.get("opportunity_count") or 0)
     r1, r2, r3, r4, r5 = st.columns(5)
     r1.metric("1-star", data.get("rating_1", 0))
     r2.metric("2-star", data.get("rating_2", 0))
@@ -302,6 +308,12 @@ def _overview(myntra_only: bool, ai_ok: bool) -> None:
     r4.metric("4-star", data.get("rating_4", 0))
     r5.metric("5-star", data.get("rating_5", 0))
     st.caption(
+        (
+            f"{count} real reviews available in the last 30 days. "
+            if cutoff is not None
+            else f"{count} real reviews in the active dataset. "
+        )
+        + f"Dataset limit {limit} is a maximum, not a guaranteed count. "
         f"Date range (review timestamps): {data.get('date_from') or '—'} → {data.get('date_to') or '—'}. "
         "Counts come from stored public reviews. The LLM does not invent these numbers."
     )
@@ -467,6 +479,7 @@ def _show_last_collection() -> None:
             st.write("Not run in the last collection.")
     total = get_review_count()
     st.write("**Total reviews available:**", total)
+    st.write("Dataset limit:", _dataset_limit())
     for err in stats.get("errors") or []:
         st.error(err)
 
@@ -653,6 +666,14 @@ def _ai_analysis_status_panel(ai_ok: bool) -> None:
     st.write(cfg.get("secret_source") or "Missing")
     st.write("Connection")
     st.write(connection)
+    st.write("AI model:")
+    st.write(cfg.get("model") or "")
+    st.write("Max output tokens:")
+    st.write(cfg.get("max_tokens") if cfg.get("max_tokens") is not None else 2000)
+    st.write("Batch size:")
+    st.write(cfg.get("batch_size") if cfg.get("batch_size") is not None else 5)
+    st.write("Dataset limit:")
+    st.write(cfg.get("max_dataset_reviews") if cfg.get("max_dataset_reviews") is not None else 300)
     st.caption("Configured means a secret value exists. Connection is a real OpenRouter request.")
 
     test_col, analyze_col, retry_col = st.columns(3)
@@ -699,10 +720,10 @@ def _live_data(ai_ok: bool) -> None:
     st.write("Google Play package:", OFFICIAL_GOOGLE_PLAY_APP_ID)
     st.write("Apple App ID:", OFFICIAL_APPLE_APP_ID)
     st.write("**All-time Myntra-valid reviews:**", get_review_count(myntra_only=True))
-    st.write(
-        "**Last 30-day Myntra-valid reviews:**",
-        get_review_count(since=get_last_30_days_cutoff(), myntra_only=True),
-    )
+    last_30 = get_review_count(since=get_last_30_days_cutoff(), myntra_only=True)
+    st.write("**Last 30-day Myntra-valid reviews:**", last_30)
+    st.write(f"{last_30} real reviews available in the last 30 days")
+    st.write("Dataset limit:", _dataset_limit())
     st.caption("Storage: Local application storage. Streamlit Cloud restarts can wipe stored reviews.")
 
     _show_last_collection()
@@ -712,12 +733,13 @@ def _live_data(ai_ok: bool) -> None:
     diag = get_database_diagnostics()
     st.subheader("DATABASE DIAGNOSTICS")
     st.write("Total reviews:", diag.get("total_reviews"))
-    st.write("Google Play reviews:", diag.get("google_play_reviews"))
-    st.write("Apple reviews:", diag.get("apple_reviews"))
-    st.write("Last 30-day reviews:", diag.get("last_30_day_reviews"))
-    st.write("Pending reviews:", diag.get("pending_reviews"))
-    st.write("Analyzed reviews:", diag.get("analyzed_reviews"))
-    st.write("Failed reviews:", diag.get("failed_reviews"))
+    st.write("Maximum dataset size:", diag.get("max_dataset_reviews") or _dataset_limit())
+    st.write("Google Play:", diag.get("google_play_reviews"))
+    st.write("Apple App Store:", diag.get("apple_reviews"))
+    st.write("Last 30 days:", diag.get("last_30_day_reviews"))
+    st.write("Pending:", diag.get("pending_reviews"))
+    st.write("Analyzed:", diag.get("analyzed_reviews"))
+    st.write("Failed:", diag.get("failed_reviews"))
     _collect_buttons(ai_ok)
 
     analyze = st.checkbox("Analyze new reviews after each poll", value=ai_ok)

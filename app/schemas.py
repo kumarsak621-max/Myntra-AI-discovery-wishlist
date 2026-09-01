@@ -145,6 +145,8 @@ class ReviewAnalysisSchema(BaseModel):
     @field_validator("evidence_strength", "confidence", mode="before")
     @classmethod
     def _clamp_int(cls, value: Any) -> int:
+        if isinstance(value, float) and 0 <= value <= 1:
+            return max(1, min(5, int(round(value * 5)) or 1))
         try:
             number = int(value)
         except (TypeError, ValueError):

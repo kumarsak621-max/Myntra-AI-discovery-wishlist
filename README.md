@@ -168,7 +168,7 @@ score = reach × frequency × purchase_impact × severity × evidence_confidence
 
 Each dimension is 1–5.
 
-AI analysis is cached by review content hash. Unchanged `analyzed` reviews are not sent to the model again. New reviews are stored as `pending`. Failed reviews are retried and store the error. OpenRouter requests use batches of `AI_REQUEST_BATCH_SIZE` / `AI_BATCH_SIZE` (default **5** reviews per request). The first analysis run is capped at **5** reviews so the OpenRouter path can be verified before processing the rest. A later run processes up to `AI_ANALYSIS_BATCH_SIZE` (default 60) pending reviews so Streamlit Cloud requests do not time out. Click **Analyze Pending Reviews** or **Run Full Discovery Pipeline** again to continue. **Retry Failed Analysis** re-sends only `failed` rows.
+AI analysis is cached by review content hash. Unchanged `analyzed` reviews are not sent to the model again. New reviews are stored as `pending`. Failed reviews are retried and store the error. OpenRouter requests use `max_tokens` from `AI_MAX_TOKENS` (default **2000**, never the 65535 model default) and batches of `AI_REQUEST_BATCH_SIZE` / `AI_BATCH_SIZE` (default **5** reviews per request). The first analysis run is capped at **1** review, then **5**, so the OpenRouter path can be verified before processing the rest. A later run processes up to `AI_ANALYSIS_BATCH_SIZE` (default 60) pending reviews so Streamlit Cloud requests do not time out. Click **Analyze Pending Reviews** or **Run Full Discovery Pipeline** again to continue. **Retry Failed Analysis** re-sends only `failed` rows. HTTP 402 credit/token errors leave reviews pending for retry.
 
 If discovery pages are empty, Live Data explains the actual reason (no reviews, pending analysis, missing API key, or a stored analysis error). It never treats stored reviews as “no data collected.” If reviews were stored but analysis failed, the UI shows `Reviews collected successfully, but OpenRouter analysis failed.` plus the actual error.
 
@@ -185,7 +185,7 @@ On **Live Data** use **Test OpenRouter Connection** to send a real OpenRouter re
 5. Rebuild themes, segments, and opportunity scores
 6. Refresh the dashboard
 
-If ~1300 reviews are already in the local database, the pipeline uses them and does not re-download. Use **Collect Last 30 Days** only when you need new collection.
+If ~1300 reviews are already in the local database, the pipeline enforces `MAX_DATASET_REVIEWS` (default **300**), keeps the newest real Google Play and Apple reviews, and deletes the rest. It does not fabricate reviews to reach 300. Use **Collect Last 30 Days** only when you need new collection.
 
 ## Diagnostics
 
@@ -199,7 +199,7 @@ Prints database path and counts, collector status, OpenRouter configuration (nev
 
 | Symptom | What it actually means |
 | --- | --- |
-| No reviews have been collected yet. | Database has 0 stored reviews. Click Collect Last 30 Days. |
+| No real reviews available for analysis. | Database has 0 stored reviews. Click Collect Last 30 Days. |
 | X real reviews are awaiting AI analysis. | Reviews are stored as `pending`. Set `OPENROUTER_API_KEY`, Test OpenRouter Connection, then Analyze Pending Reviews. |
 | OpenRouter analysis failed for X reviews. | Per-review `failed` rows exist. Open Live Data for `Last error`. Click Retry Failed Analysis. |
 | OpenRouter API key is not configured. | Missing from `.env` locally or Streamlit Secrets in the cloud. |
@@ -215,7 +215,7 @@ Period can be switched to **All Time**. Last-30-day metrics use review timestamp
 
 If nothing has been collected yet, the UI shows:
 
-`No reviews have been collected yet.`
+`No real reviews available for analysis.`
 
 plus **Collect Last 30 Days** and **Refresh Latest Reviews**.
 
@@ -235,6 +235,9 @@ Default filter: **Myntra-valid evidence only**.
 ```toml
 OPENROUTER_API_KEY = "your_openrouter_key"
 OPENROUTER_MODEL = "google/gemini-2.5-flash"
+MAX_DATASET_REVIEWS = 300
+AI_MAX_TOKENS = 2000
+AI_BATCH_SIZE = 5
 ```
 
 Use a real OpenRouter key that starts with `sk-or-v1-`. Do not paste a Google Gemini `AIza...` key. Do not wrap the key in extra quotes inside the value. After saving secrets, click **Test OpenRouter Connection**. "API KEY Configured" only means a value exists; HTTP 401 means OpenRouter rejected that credential.

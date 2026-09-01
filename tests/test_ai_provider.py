@@ -5,6 +5,7 @@ import httpx
 from app.ai.provider import (
     AIError,
     AUTH_401_MESSAGE,
+    CREDIT_402_MESSAGE,
     OpenRouterAIService,
     QUOTA_MESSAGE,
 )
@@ -72,6 +73,8 @@ def test_gemini_openrouter_skips_json_object_mode(monkeypatch):
     assert client.calls[0]["json"]["model"] == "google/gemini-2.5-flash"
     assert "unit-test-key" not in str(client.calls[0]["headers"]["Authorization"]) or True
     assert client.calls[0]["headers"]["Authorization"] == "Bearer unit-test-key"
+    assert client.calls[0]["json"]["max_tokens"] == 2000
+    assert client.calls[0]["json"]["max_tokens"] != 65535
 
 
 def test_json_mode_400_retries_without_response_format(monkeypatch):
@@ -145,6 +148,30 @@ def test_401_is_not_retried(monkeypatch):
         assert exc.http_status == 401
         assert "unit-test-key" not in str(exc)
     assert len(client.calls) == 1
+
+
+def test_402_is_not_retried_and_uses_credit_message(monkeypatch):
+    client = FakeClient(
+        [
+            FakeResponse(
+                402,
+                text='{"error":{"message":"You requested up to 65535 tokens, but can only afford 16000."}}',
+            )
+        ]
+    )
+    monkeypatch.setattr("httpx.Client", lambda *a, **k: client)
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    try:
+        _provider().complete_json(system="s", user="u")
+        raise AssertionError("should have failed")
+    except AIError as exc:
+        assert str(exc) == CREDIT_402_MESSAGE
+        assert exc.http_status == 402
+        assert exc.retryable is False
+        assert "65535" not in str(exc)
+    assert len(client.calls) == 1
+    assert client.calls[0]["json"]["max_tokens"] == 2000
+    assert client.calls[0]["json"]["max_tokens"] != 65535
 
 
 def test_quota_maps_to_clear_message(monkeypatch):

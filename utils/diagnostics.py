@@ -62,6 +62,7 @@ def run_diagnostics() -> dict:
             "database": {
                 "path": str(sqlite_path() or ""),
                 "total_reviews": base.get("total_reviews") or 0,
+                "max_dataset_reviews": base.get("max_dataset_reviews") or 300,
                 "google_play_reviews": base.get("google_play_reviews") or 0,
                 "apple_reviews": base.get("apple_reviews") or 0,
                 "last_30_day_reviews": base.get("last_30_day_reviews") or 0,

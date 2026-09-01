@@ -11,6 +11,7 @@ import httpx
 
 from app.config import Settings, get_settings
 from config.settings import (
+    clamp_max_tokens,
     normalize_openrouter_api_key,
     normalize_openrouter_model,
     resolve_openrouter_credentials,
@@ -19,6 +20,9 @@ from config.settings import (
 logger = logging.getLogger(__name__)
 
 QUOTA_MESSAGE = "OpenRouter rate limit reached. Please try again later."
+CREDIT_402_MESSAGE = (
+    "OpenRouter token/credit limit reached. Reduce max_tokens or add credits."
+)
 MISSING_KEY_MESSAGE = (
     "OpenRouter API key is not configured. "
     "Add OPENROUTER_API_KEY to Streamlit Secrets or .env."
@@ -33,14 +37,6 @@ GEMINI_KEY_MESSAGE = (
     "Use an OpenRouter key that starts with sk-or- in Streamlit Secrets."
 )
 OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
-
-logger = logging.getLogger(__name__)
-
-QUOTA_MESSAGE = "OpenRouter API quota/rate limit reached. Please try again later."
-MISSING_KEY_MESSAGE = (
-    "OpenRouter API key is not configured. "
-    "Add OPENROUTER_API_KEY to Streamlit Secrets or .env."
-)
 DEFAULT_TIMEOUT = httpx.Timeout(60.0, connect=15.0)
 
 
@@ -96,6 +92,10 @@ class OpenRouterAIService:
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
+        self.last_usage: dict[str, int] = {}
+
+    def _max_output_tokens(self) -> int:
+        return clamp_max_tokens(getattr(self.settings, "ai_max_tokens", 2000))
 
     @property
     def provider_name(self) -> str:
@@ -189,9 +189,11 @@ class OpenRouterAIService:
         raise last_error or AIError("OpenRouter request failed")
 
     def _post_chat(self, *, system: str, user: str, json_object: bool) -> str:
+        max_tokens = self._max_output_tokens()
         payload: dict[str, Any] = {
             "model": self.model,
             "temperature": 0.2,
+            "max_tokens": max_tokens,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -206,7 +208,9 @@ class OpenRouterAIService:
             raise AIError("The OpenRouter request timed out. Try fewer reviews, then retry.", retryable=True) from exc
         except httpx.ConnectError as exc:
             raise AIError("Network error contacting OpenRouter.", retryable=True) from exc
-        return _content_from_response(response)
+        text, usage = _content_from_response(response)
+        self.last_usage = usage
+        return text
 
 
 AIProvider = OpenRouterAIService
@@ -248,7 +252,7 @@ def _openrouter_error_text(response: httpx.Response) -> str:
     return body[:300]
 
 
-def _content_from_response(response: httpx.Response) -> str:
+def _content_from_response(response: httpx.Response) -> tuple[str, dict[str, int]]:
     status = response.status_code
     snippet = _openrouter_error_text(response)
     if status == 401:
@@ -267,6 +271,8 @@ def _content_from_response(response: httpx.Response) -> str:
         )
     if status == 429:
         raise AIError(QUOTA_MESSAGE, retryable=True, http_status=429)
+    if status == 402:
+        raise AIError(CREDIT_402_MESSAGE, http_status=402)
     if status in {500, 502, 503, 504}:
         raise AIError(
             f"OpenRouter/provider server error (HTTP {status}). Retrying.",
@@ -299,7 +305,18 @@ def _content_from_response(response: httpx.Response) -> str:
     text = _message_content(message)
     if not text:
         raise AIError("OpenRouter returned empty content.")
-    return text
+    usage_raw = payload.get("usage") if isinstance(payload, dict) else None
+    usage = {}
+    if isinstance(usage_raw, dict):
+        try:
+            usage = {
+                "prompt_tokens": int(usage_raw.get("prompt_tokens") or 0),
+                "completion_tokens": int(usage_raw.get("completion_tokens") or 0),
+                "total_tokens": int(usage_raw.get("total_tokens") or 0),
+            }
+        except (TypeError, ValueError):
+            usage = {}
+    return text, usage
 
 
 def _map_openrouter_exception(exc: BaseException) -> AIError:
@@ -364,7 +381,7 @@ def test_openrouter_connection(settings: Settings | None = None) -> dict[str, An
             with httpx.Client(timeout=service._timeout()) as client:
                 response = client.post(service._endpoint, headers=service._headers(), json=payload)
             result["http_status"] = response.status_code
-            text = _content_from_response(response)
+            text, _usage = _content_from_response(response)
             if not text:
                 result["error"] = "OpenRouter returned empty content."
                 return result

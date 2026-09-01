@@ -40,12 +40,10 @@ def _original_blob(review: Review) -> str:
 
 
 def _request_batch_size(settings) -> int:
-    try:
-        alias = getattr(settings, "ai_batch_size", None)
-        size = int(alias or getattr(settings, "ai_request_batch_size", 5) or 5)
-    except (TypeError, ValueError):
-        size = 5
-    return max(1, min(10, size))
+    from config.settings import clamp_batch_size
+
+    alias = getattr(settings, "ai_batch_size", None)
+    return clamp_batch_size(alias or getattr(settings, "ai_request_batch_size", 5) or 5)
 
 
 def smoke_test_analyze_limit(db: Session, settings) -> int:
@@ -97,6 +95,14 @@ def persist_analysis(
     row.analysis_version = ANALYSIS_VERSION
     if http_status and hasattr(row, "http_status"):
         row.http_status = int(http_status)
+    usage = getattr(provider, "last_usage", None) or {}
+    if parsed is not None and isinstance(usage, dict):
+        if hasattr(row, "prompt_tokens"):
+            row.prompt_tokens = int(usage.get("prompt_tokens") or 0)
+        if hasattr(row, "completion_tokens"):
+            row.completion_tokens = int(usage.get("completion_tokens") or 0)
+        if hasattr(row, "total_tokens"):
+            row.total_tokens = int(usage.get("total_tokens") or 0)
 
     if parsed is not None:
         row.relevance = parsed.relevance
@@ -217,6 +223,8 @@ def _analyze_batch(
         error = redact_secrets(str(exc))
         http_status = getattr(exc, "http_status", None)
         logger.warning("AI batch failed (%s reviews): %s", len(chunk), error)
+        if http_status == 402:
+            return 0, 0, error, http_status
         for review in chunk:
             persist_analysis(db, review, None, "", error, provider, http_status=http_status)
         return 0, len(chunk), error, http_status
@@ -280,6 +288,9 @@ def analyze_new_reviews(
 ) -> AnalysisRunResult:
     provider = provider or AIProvider(get_settings())
     settings = getattr(provider, "settings", None) or get_settings()
+    from app.pipeline.dataset import enforce_review_limit
+
+    enforce_review_limit(db, getattr(settings, "max_dataset_reviews", None))
     pending = reviews_needing_analysis(
         db, only_failed=only_failed, include_failed=include_failed
     )
@@ -292,7 +303,7 @@ def analyze_new_reviews(
         from app.database import get_review_count
 
         message = (
-            "No reviews have been collected yet."
+            "No real reviews available for analysis."
             if get_review_count(db) == 0
             else "No new Myntra-valid reviews needed analysis (already analyzed)."
         )
@@ -323,6 +334,11 @@ def analyze_new_reviews(
             analyzed, failed, error, http_status = _analyze_batch(db, provider, chunk, max_chars=max_chars)
             result.analyzed += analyzed
             result.failed += failed
+            if http_status == 402:
+                result.last_error = error
+                result.last_http_status = http_status
+                db.commit()
+                break
             result.processed += len(chunk)
             processed += len(chunk)
             if error:

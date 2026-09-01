@@ -58,6 +58,35 @@ def normalize_openrouter_api_key(value: str | None) -> str:
     return text
 
 
+def clamp_max_tokens(value) -> int:
+    """Output-token cap for OpenRouter. Never allow the 65535 model default."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = 2000
+    return max(64, min(2000, number))
+
+
+def clamp_batch_size(value) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = 5
+    return max(1, min(10, number))
+
+
+DEFAULT_MAX_DATASET_REVIEWS = 300
+
+
+def clamp_max_dataset_reviews(value) -> int:
+    """Active real-review cap. 300 is a maximum, not a target to fabricate toward."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = DEFAULT_MAX_DATASET_REVIEWS
+    return max(1, min(10_000, number))
+
+
 def openrouter_key_prefix_status(key: str) -> str:
     if not key:
         return "MISSING"
@@ -111,6 +140,7 @@ class Settings(BaseSettings):
     google_play_window_safety_limit: int = 800
     apple_window_safety_limit: int = 500
     refresh_safety_limit: int = 150
+    max_dataset_reviews: int = DEFAULT_MAX_DATASET_REVIEWS
     expected_app_name: str = OFFICIAL_GOOGLE_PLAY_APP_NAME
     expected_apple_app_name: str = OFFICIAL_APPLE_APP_NAME
 
@@ -119,6 +149,7 @@ class Settings(BaseSettings):
     ai_analysis_batch_size: int = 60
     ai_request_batch_size: int = 5
     ai_batch_size: int | None = None
+    ai_max_tokens: int = 2000
     ai_retry_attempts: int = 5
 
     host: str = "127.0.0.1"
@@ -132,6 +163,12 @@ class Settings(BaseSettings):
             self.openrouter_model = DEFAULT_OPENROUTER_MODEL
         if not (self.ai_model or "").strip():
             self.ai_model = DEFAULT_OPENROUTER_MODEL
+        self.ai_max_tokens = clamp_max_tokens(self.ai_max_tokens)
+        self.ai_request_batch_size = clamp_batch_size(
+            self.ai_batch_size if self.ai_batch_size is not None else self.ai_request_batch_size
+        )
+        self.ai_batch_size = self.ai_request_batch_size
+        self.max_dataset_reviews = clamp_max_dataset_reviews(self.max_dataset_reviews)
         return self
 
     @property
@@ -249,6 +286,20 @@ def get_settings() -> Settings:
     if secret_model:
         settings.openrouter_model = secret_model
         settings.ai_model = secret_model
+    secret_tokens = _streamlit_secret("AI_MAX_TOKENS")
+    if secret_tokens:
+        settings.ai_max_tokens = clamp_max_tokens(secret_tokens)
+    else:
+        settings.ai_max_tokens = clamp_max_tokens(settings.ai_max_tokens)
+    secret_batch = _streamlit_secret("AI_BATCH_SIZE")
+    if secret_batch:
+        settings.ai_batch_size = clamp_batch_size(secret_batch)
+        settings.ai_request_batch_size = settings.ai_batch_size
+    secret_limit = _streamlit_secret("MAX_DATASET_REVIEWS")
+    if secret_limit:
+        settings.max_dataset_reviews = clamp_max_dataset_reviews(secret_limit)
+    else:
+        settings.max_dataset_reviews = clamp_max_dataset_reviews(settings.max_dataset_reviews)
     settings.ai_provider = "openrouter"
     return settings
 
@@ -277,6 +328,11 @@ def get_ai_config() -> dict:
         "secret_source": creds.get("source") or "Missing",
         "key_format": creds.get("key_format") or "MISSING",
         "key_prefix": creds.get("key_prefix") or "none",
+        "max_tokens": clamp_max_tokens(settings.ai_max_tokens),
+        "batch_size": clamp_batch_size(
+            settings.ai_batch_size or settings.ai_request_batch_size or 5
+        ),
+        "max_dataset_reviews": clamp_max_dataset_reviews(settings.max_dataset_reviews),
         "missing_key_message": (
             "OpenRouter API key is not configured. "
             "Add OPENROUTER_API_KEY to Streamlit Secrets or .env."

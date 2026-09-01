@@ -73,7 +73,16 @@ def parse_batch_payload(raw_response: str) -> tuple[list[dict[str, Any]], str]:
     elif isinstance(value, dict):
         if isinstance(value.get("results"), list):
             items = value["results"]
-        elif "relevance" in value or "id" in value:
+        elif {
+            "relevance",
+            "id",
+            "problem",
+            "wishlist_signal",
+            "purchase_barrier",
+            "uncertainty",
+            "theme",
+            "segment",
+        }.intersection(value):
             items = [value]
         else:
             return [], "Malformed AI JSON: missing results[] array"
@@ -141,9 +150,40 @@ def try_validate_payload(
     cleaned = {key: value for key, value in payload.items() if key not in {"id", "source_review_id"}}
     if cleaned.get("user_problem") and not cleaned.get("root_cause"):
         cleaned["root_cause"] = {"statement": str(cleaned.get("user_problem") or "")}
+    if cleaned.get("problem") and not cleaned.get("root_cause"):
+        cleaned["root_cause"] = {"statement": str(cleaned.get("problem") or "")}
     barrier = cleaned.get("purchase_barrier")
     if barrier and not cleaned.get("barriers"):
         cleaned["barriers"] = barrier if isinstance(barrier, list) else [str(barrier)]
+    uncertainty = cleaned.get("uncertainty")
+    if uncertainty and not cleaned.get("uncertainties"):
+        cleaned["uncertainties"] = uncertainty if isinstance(uncertainty, list) else [str(uncertainty)]
+    theme = str(cleaned.get("theme") or "").strip()
+    if theme and not cleaned.get("intent"):
+        cleaned["intent"] = [theme]
+    segment = str(cleaned.get("segment") or "").strip()
+    if segment:
+        factors = list(cleaned.get("decision_factors") or [])
+        if segment not in factors:
+            factors.append(segment)
+        cleaned["decision_factors"] = factors
+    if "confidence" in cleaned and isinstance(cleaned.get("confidence"), float) and cleaned["confidence"] <= 1:
+        cleaned["confidence"] = max(1, min(5, int(round(cleaned["confidence"] * 5)) or 1))
+    if cleaned.get("severity") not in (None, "") and not cleaned.get("evidence_strength"):
+        cleaned["evidence_strength"] = cleaned.get("severity")
+    evidence_type = str(cleaned.get("evidence_type") or "").strip().lower()
+    if not cleaned.get("relevance"):
+        if evidence_type == "explicit":
+            cleaned["relevance"] = "high"
+        elif evidence_type == "inferred":
+            cleaned["relevance"] = "medium"
+        elif evidence_type == "none":
+            cleaned["relevance"] = "none"
+        elif cleaned.get("problem") or cleaned.get("purchase_barrier") or cleaned.get("uncertainty"):
+            cleaned["relevance"] = "medium"
+    if cleaned.get("purchase_barrier") and not cleaned.get("purchase_signal"):
+        cleaned["purchase_signal"] = "hesitant"
+        cleaned["purchase_hesitation"] = cleaned.get("purchase_hesitation") or "implicit"
     try:
         return validate_analysis_payload(cleaned, original_text), ""
     except (ValueError, ValidationError, json.JSONDecodeError, TypeError) as exc:

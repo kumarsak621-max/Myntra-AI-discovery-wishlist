@@ -70,6 +70,13 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     migrate_schema()
     quarantine_non_myntra_records()
+    db = SessionLocal()
+    try:
+        from app.pipeline.dataset import enforce_review_limit
+
+        enforce_review_limit(db)
+    finally:
+        db.close()
     ensure_pending_analysis_rows()
 
 
@@ -87,6 +94,9 @@ def migrate_schema() -> None:
             "ALTER TABLE analysis ADD COLUMN analysis_version VARCHAR(32) DEFAULT '1'",
         ),
         ("analysis", "http_status", "ALTER TABLE analysis ADD COLUMN http_status INTEGER DEFAULT 0"),
+        ("analysis", "prompt_tokens", "ALTER TABLE analysis ADD COLUMN prompt_tokens INTEGER DEFAULT 0"),
+        ("analysis", "completion_tokens", "ALTER TABLE analysis ADD COLUMN completion_tokens INTEGER DEFAULT 0"),
+        ("analysis", "total_tokens", "ALTER TABLE analysis ADD COLUMN total_tokens INTEGER DEFAULT 0"),
     ]
     indexes = [
         "CREATE INDEX IF NOT EXISTS ix_reviews_review_date ON reviews(review_date)",
@@ -272,6 +282,8 @@ def get_database_diagnostics(db: Session | None = None) -> dict[str, Any]:
             last_error = redact_secrets(str(last_fail_row[0]))
         settings = get_settings()
         path = sqlite_path()
+        from config.settings import clamp_max_dataset_reviews
+
         return {
             "database_path": str(path) if path else "",
             "total_reviews": all_q.count(),
@@ -283,6 +295,7 @@ def get_database_diagnostics(db: Session | None = None) -> dict[str, Any]:
             "pending_reviews": pending + no_row,
             "analyzed_reviews": analyzed,
             "failed_reviews": failed,
+            "max_dataset_reviews": clamp_max_dataset_reviews(settings.max_dataset_reviews),
             "themes": session.query(Theme).count(),
             "segments": session.query(Segment).count(),
             "opportunities": session.query(Opportunity).count(),
@@ -340,6 +353,12 @@ def get_ai_diagnostics(db: Session | None = None) -> dict[str, Any]:
             "ai_provider": "OpenRouter",
             "ai_model": settings.resolved_model,
             "api_key_configured": "YES" if settings.has_ai_credentials else "NO",
+            "max_tokens": int(getattr(settings, "ai_max_tokens", 2000) or 2000),
+            "batch_size": int(
+                getattr(settings, "ai_batch_size", None)
+                or getattr(settings, "ai_request_batch_size", 5)
+                or 5
+            ),
             "pending_reviews": base.get("pending_reviews") or 0,
             "analyzed_reviews": base.get("analyzed_reviews") or 0,
             "failed_reviews": base.get("failed_reviews") or 0,
@@ -349,6 +368,7 @@ def get_ai_diagnostics(db: Session | None = None) -> dict[str, Any]:
             "last_http_status": last_http,
             "myntra_reviews": base.get("myntra_reviews") or 0,
             "total_reviews": base.get("total_reviews") or 0,
+            "max_dataset_reviews": base.get("max_dataset_reviews") or 300,
             "last_30_day_reviews": base.get("last_30_day_reviews") or 0,
         }
     finally:

@@ -143,6 +143,9 @@ class Analysis(Base):
     status: Mapped[str] = mapped_column(String(32), default="pending")
     analysis_version: Mapped[str] = mapped_column(String(32), default="1")
     http_status: Mapped[int] = mapped_column(Integer, default=0)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0)
 
     review: Mapped[Review] = relationship(back_populates="analysis")
 

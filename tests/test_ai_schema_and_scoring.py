@@ -78,6 +78,46 @@ def test_wishlist_false_coerces_to_none():
     assert parsed.wishlist_signal == "none"
 
 
+def test_compact_json_maps_to_dashboard_schema():
+    from app.ai.schema import try_validate_payload
+
+    payload = {
+        "problem": "size chart is missing",
+        "wishlist_signal": True,
+        "purchase_barrier": "size",
+        "uncertainty": "Will it fit?",
+        "theme": "fit confidence",
+        "segment": "apparel shoppers",
+        "severity": 4,
+        "purchase_impact": 4,
+        "evidence_type": "explicit",
+        "confidence": 0.8,
+    }
+    parsed, error = try_validate_payload(payload, "Wishlisted a dress but the size chart is missing.")
+    assert error == ""
+    assert parsed is not None
+    assert parsed.root_cause.statement == "size chart is missing"
+    assert parsed.wishlist_signal == "implicit"
+    assert parsed.barriers == ["size"]
+    assert parsed.uncertainties == ["Will it fit?"]
+    assert parsed.intent == ["fit confidence"]
+    assert "apparel shoppers" in parsed.decision_factors
+    assert parsed.evidence_strength == 4
+    assert parsed.confidence == 4
+    assert parsed.relevance == "high"
+    assert parsed.purchase_signal == "hesitant"
+
+
+def test_compact_single_object_parses_without_results_array():
+    from app.ai.schema import parse_batch_payload
+
+    raw = '{"problem":"price too high","wishlist_signal":true,"purchase_barrier":"price"}'
+    items, error = parse_batch_payload(raw)
+    assert error == ""
+    assert len(items) == 1
+    assert items[0]["problem"] == "price too high"
+
+
 def test_opportunity_score_is_deterministic():
     assert opportunity_score(5, 5, 5, 5, 5) == 3125
     assert opportunity_score(1, 1, 1, 1, 1) == 1

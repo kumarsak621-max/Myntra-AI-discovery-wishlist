@@ -74,6 +74,11 @@ def test_get_ai_config_never_returns_key():
     assert cfg["provider"] == "openrouter"
     assert cfg["provider_label"] == "OpenRouter"
     assert cfg["model"]
+    assert cfg["max_tokens"] == 2000 or 64 <= int(cfg["max_tokens"]) <= 2000
+    assert int(cfg["max_tokens"]) != 65535
+    assert 1 <= int(cfg["batch_size"]) <= 10
+    assert int(cfg["max_dataset_reviews"]) == 300 or int(cfg["max_dataset_reviews"]) >= 1
+    assert int(cfg["max_dataset_reviews"]) != 1300
     assert "openrouter_api_key" not in cfg
     assert "api_key" not in cfg
     dumped = str(cfg)
@@ -94,6 +99,21 @@ def test_get_ai_config_never_returns_key():
     if not cfg["configured"]:
         assert "OPENROUTER_API_KEY" in cfg["missing_key_message"]
         assert "Gemini" not in cfg["missing_key_message"]
+
+
+def test_clamp_max_dataset_reviews_defaults_to_300():
+    from config.settings import DEFAULT_MAX_DATASET_REVIEWS, clamp_max_dataset_reviews, Settings
+
+    assert DEFAULT_MAX_DATASET_REVIEWS == 300
+    assert clamp_max_dataset_reviews(None) == 300
+    assert clamp_max_dataset_reviews("300") == 300
+    assert Settings(max_dataset_reviews=300).max_dataset_reviews == 300
+    from config.settings import clamp_max_tokens
+
+    assert clamp_max_tokens(65535) == 2000
+    assert clamp_max_tokens(None) == 2000
+    assert clamp_max_tokens(2000) == 2000
+    assert Settings(ai_max_tokens=65535).ai_max_tokens == 2000
 
 
 def test_normalize_strips_quotes_and_bearer():
