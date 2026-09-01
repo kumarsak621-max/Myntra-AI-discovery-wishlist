@@ -34,17 +34,31 @@ def is_myntra_evidence(review: Review) -> bool:
     return bool(review.is_valid_source) and (review.app_id or "") in official_ids()
 
 
-def review_query(db: Session, *, myntra_only: bool = False, since: datetime | None = None):
+def review_query(
+    db: Session,
+    *,
+    myntra_only: bool = False,
+    since: datetime | None = None,
+    source: str | None = None,
+):
     q = db.query(Review).filter(Review.is_duplicate.is_(False), Review.is_empty.is_(False))
     if myntra_only:
         q = q.filter(Review.is_valid_source.is_(True), Review.app_id.in_(list(official_ids())))
     if since is not None:
         q = q.filter(Review.review_date.isnot(None), Review.review_date >= since)
+    if source in {"google_play", "apple_app_store"}:
+        q = q.filter(Review.source == source)
     return q
 
 
-def overview_metrics(db: Session, *, since: datetime | None = None, myntra_only: bool = False) -> dict[str, Any]:
-    all_reviews = review_query(db, myntra_only=myntra_only, since=since).all()
+def overview_metrics(
+    db: Session,
+    *,
+    since: datetime | None = None,
+    myntra_only: bool = False,
+    source: str | None = None,
+) -> dict[str, Any]:
+    all_reviews = review_query(db, myntra_only=myntra_only, since=since, source=source).all()
     myntra = [r for r in all_reviews if is_myntra_evidence(r)]
     reference = [r for r in all_reviews if not is_myntra_evidence(r)]
     analyzed = [r for r in all_reviews if r.analysis and r.analysis.is_valid_json]
@@ -58,16 +72,16 @@ def overview_metrics(db: Session, *, since: datetime | None = None, myntra_only:
     by_classification = Counter(r.data_classification for r in all_reviews)
     ratings = [r.rating for r in all_reviews if r.rating is not None]
     dates = [r.review_date for r in all_reviews if r.review_date]
-    barriers = label_distribution_safe(db, "barriers", myntra_only=True, since=since)
-    wishlist = signal_counts(db, myntra_only=True, since=since)
-    intents = label_distribution_safe(db, "intent", myntra_only=True, since=since)
-    uncertainties = label_distribution_safe(db, "uncertainties", myntra_only=True, since=since)
+    barriers = label_distribution_safe(db, "barriers", myntra_only=True, since=since, source=source)
+    wishlist = signal_counts(db, myntra_only=True, since=since, source=source)
+    intents = label_distribution_safe(db, "intent", myntra_only=True, since=since, source=source)
+    uncertainties = label_distribution_safe(db, "uncertainties", myntra_only=True, since=since, source=source)
 
     from app.models import Opportunity, Theme
 
     theme_count = db.query(Theme).count()
     opportunity_count = db.query(Opportunity).count()
-    problems = root_cause_distribution(db, myntra_only=True, since=since)
+    problems = root_cause_distribution(db, myntra_only=True, since=since, source=source)
     return {
         "total_reviews": len(all_reviews),
         "myntra_reviews": len(myntra),
@@ -101,10 +115,15 @@ def overview_metrics(db: Session, *, since: datetime | None = None, myntra_only:
 
 
 def label_distribution_safe(
-    db: Session, field: str, *, myntra_only: bool = False, since: datetime | None = None
+    db: Session,
+    field: str,
+    *,
+    myntra_only: bool = False,
+    since: datetime | None = None,
+    source: str | None = None,
 ) -> list[dict[str, Any]]:
     try:
-        return label_distribution(db, field, myntra_only=myntra_only, since=since)
+        return label_distribution(db, field, myntra_only=myntra_only, since=since, source=source)
     except Exception as exc:
         logger.warning("Could not compute %s distribution: %s", field, exc)
         return []
@@ -117,8 +136,9 @@ def label_distribution(
     myntra_only: bool = False,
     relevant_only: bool = True,
     since: datetime | None = None,
+    source: str | None = None,
 ) -> list[dict[str, Any]]:
-    rows = review_query(db, myntra_only=myntra_only, since=since).all()
+    rows = review_query(db, myntra_only=myntra_only, since=since, source=source).all()
     items: list[tuple[Review, Analysis]] = []
     for review in rows:
         analysis = review.analysis
@@ -170,8 +190,10 @@ def label_distribution(
     return ranked
 
 
-def signal_counts(db: Session, *, myntra_only: bool = False, since: datetime | None = None) -> dict[str, Any]:
-    rows = review_query(db, myntra_only=myntra_only, since=since).all()
+def signal_counts(
+    db: Session, *, myntra_only: bool = False, since: datetime | None = None, source: str | None = None
+) -> dict[str, Any]:
+    rows = review_query(db, myntra_only=myntra_only, since=since, source=source).all()
     analyzed = [r for r in rows if r.analysis and r.analysis.is_valid_json]
     denom = len(analyzed) or 1
     wishlist = sum(
@@ -310,6 +332,7 @@ def label_window_momentum(
     myntra_only: bool = True,
     now: datetime | None = None,
     min_count: int = 3,
+    source: str | None = None,
 ) -> list[dict[str, Any]]:
     """First-half vs second-half of the window. Descriptive only — not a significance test."""
     from app.pipeline.dates import ensure_aware, utcnow
@@ -319,7 +342,7 @@ def label_window_momentum(
     if start is None:
         return []
     midpoint = start + (end - start) / 2
-    rows = review_query(db, myntra_only=myntra_only, since=start).all()
+    rows = review_query(db, myntra_only=myntra_only, since=start, source=source).all()
     first: Counter[str] = Counter()
     second: Counter[str] = Counter()
     evidence: dict[str, list[int]] = defaultdict(list)
@@ -371,9 +394,9 @@ def label_window_momentum(
 
 
 def root_cause_distribution(
-    db: Session, *, myntra_only: bool = True, since: datetime | None = None
+    db: Session, *, myntra_only: bool = True, since: datetime | None = None, source: str | None = None
 ) -> list[dict[str, Any]]:
-    rows = review_query(db, myntra_only=myntra_only, since=since).all()
+    rows = review_query(db, myntra_only=myntra_only, since=since, source=source).all()
     counts: Counter[str] = Counter()
     review_ids: dict[str, list[int]] = defaultdict(list)
     analyzed = 0
@@ -399,12 +422,14 @@ def root_cause_distribution(
     ]
 
 
-def problem_rows(db: Session, *, myntra_only: bool = True, since: datetime | None = None) -> list[dict[str, Any]]:
+def problem_rows(
+    db: Session, *, myntra_only: bool = True, since: datetime | None = None, source: str | None = None
+) -> list[dict[str, Any]]:
     """Aggregate root causes with frequency, severity, and purchase impact from real analyses."""
     from app.models import Analysis
     from app.pipeline.scoring import purchase_impact_from_hesitation, severity_from_strength
 
-    dist = root_cause_distribution(db, myntra_only=myntra_only, since=since)
+    dist = root_cause_distribution(db, myntra_only=myntra_only, since=since, source=source)
     out = []
     for item in dist:
         ids = item.get("review_ids") or []
@@ -490,3 +515,205 @@ def source_live_status(db: Session) -> dict[str, Any]:
         "last_run": last_run,
         "last_successful_run": last_ok,
     }
+
+
+# Keyword taxonomies used only against real review text + stored analysis labels.
+# A category appears only when at least one review actually matches.
+WISHLIST_BEHAVIOR_TERMS = {
+    "Save for later": ("wishlist", "wish list", "save for later", "saved", "bookmark", "bookmarked"),
+    "Price monitoring": ("price", "expensive", "sale", "discount", "offer", "cheap", "costly", "value"),
+    "Compare options": ("compar", "vs ", "versus", "alternative", "other brand", "options"),
+    "Inspiration": ("inspir", "look", "style", "trend", "aesthetic"),
+    "Like / desire": ("love", "like this", "want this", "must have", "crush"),
+    "Occasion planning": ("occasion", "wedding", "party", "festival", "event", "outfit"),
+    "Purchase intent": ("will buy", "going to buy", "intend", "planning to buy", "add to bag"),
+    "Bookmarking": ("bookmark", "later", "maybe", "not now", "someday"),
+}
+
+BARRIER_TERMS = {
+    "Price / Value": ("price", "expensive", "cheap", "value", "cost", "overpriced"),
+    "Size / Fit": ("size", "fit", "sizing", "chart", "measurement"),
+    "Quality": ("quality", "cheap fabric", "tear", "poor quality"),
+    "Returns / Exchange": ("return", "exchange", "refund"),
+    "Delivery": ("delivery", "shipping", "late", "courier"),
+    "Product information": ("description", "details missing", "info", "information"),
+    "Reviews / Ratings": ("review", "rating", "fake review"),
+    "Color": ("color", "colour", "shade"),
+    "Material": ("material", "fabric", "cotton", "silk"),
+    "Styling": ("style", "look", "styling"),
+    "Trust": ("trust", "fake", "scam", "authentic"),
+    "Availability": ("out of stock", "unavailable", "sold out"),
+}
+
+UNCERTAINTY_TERMS = {
+    "Fit": ("fit", "fitting"),
+    "Size": ("size", "sizing", "chart"),
+    "Fabric": ("fabric",),
+    "Material": ("material",),
+    "Quality": ("quality", "durable"),
+    "Color": ("color", "colour"),
+    "Look / Styling": ("look", "style", "styling"),
+    "Returns": ("return", "exchange"),
+    "Delivery": ("delivery", "shipping"),
+    "Durability": ("durable", "lasting", "wear"),
+    "Reviews": ("review", "rating"),
+    "Social validation": ("friend", "family", "people say"),
+}
+
+COMPARISON_TERMS = {
+    "Price": ("price", "cheaper", "expensive"),
+    "Fit / Size": ("size", "fit"),
+    "Quality": ("quality",),
+    "Material": ("material", "fabric"),
+    "Color": ("color", "colour"),
+    "Reviews": ("review",),
+    "Ratings": ("rating", "stars"),
+    "Brand": ("brand",),
+    "Style": ("style", "look"),
+    "Features": ("feature",),
+}
+
+COMPARISON_METHOD_TERMS = {
+    "Myntra/AJIO": ("myntra", "ajio"),
+    "Other marketplaces": ("amazon", "flipkart", "meesho", "nykaa"),
+    "Google Search": ("google", "searched"),
+    "Social media": ("instagram", "youtube", "facebook", "reddit"),
+    "Friends / Family": ("friend", "family", "sister", "mom"),
+}
+
+EXTERNAL_TERMS = {
+    "Google": ("google", "googled"),
+    "YouTube": ("youtube", "yt"),
+    "Instagram": ("instagram", "insta"),
+    "Reddit": ("reddit",),
+    "Other marketplaces": ("amazon", "flipkart", "ajio", "nykaa"),
+    "Friends / Family": ("friend", "family", "asked my"),
+    "Price comparison": ("compare price", "cheaper on", "price comparison"),
+}
+
+SOCIAL_TERMS = {
+    "Ratings": ("rating", "stars"),
+    "Reviews": ("review", "reviews"),
+    "Photos": ("photo", "picture", "image"),
+    "Videos": ("video", "reel"),
+    "Friends": ("friend",),
+    "Family": ("family", "mom", "sister"),
+    "Influencers": ("influencer", "blogger"),
+    "Social media": ("instagram", "youtube", "social"),
+}
+
+PURCHASE_BEHAVIOR_TERMS = {
+    "Immediate purchase intent": ("bought", "purchased", "ordered", "will buy"),
+    "Delayed purchase": ("later", "wait", "postpone", "not now"),
+    "Comparison before purchase": ("compar", "vs ", "alternative"),
+    "Waiting for price changes": ("sale", "discount", "offer", "cheaper"),
+    "Waiting for information": ("not sure", "confused", "need to know"),
+    "Seeking validation": ("review", "rating", "ask"),
+    "Bookmarking": ("wishlist", "save", "bookmark"),
+    "Repeat purchase": ("again", "repeat", "reorder"),
+    "Abandoned intent": ("cancelled", "abandoned", "did not buy", "didn't buy"),
+}
+
+
+def _review_evidence_blob(review: Review) -> str:
+    analysis = review.analysis
+    parts = [review.title or "", review.text or ""]
+    if analysis and analysis.is_valid_json:
+        parts.append(analysis.root_cause or "")
+        for attr in (
+            "intent_json",
+            "barriers_json",
+            "uncertainties_json",
+            "decision_factors_json",
+            "behavioral_signals_json",
+            "information_seeking_json",
+        ):
+            raw = getattr(analysis, attr, "") or ""
+            parts.append(raw)
+        parts.append(analysis.purchase_signal or "")
+        parts.append(analysis.wishlist_signal or "")
+    return " ".join(parts).lower()
+
+
+def taxonomy_counts(
+    db: Session,
+    taxonomy: dict[str, tuple[str, ...]],
+    *,
+    myntra_only: bool = True,
+    since: datetime | None = None,
+    analyzed_only: bool = True,
+    source: str | None = None,
+) -> list[dict[str, Any]]:
+    """Count real reviews whose stored text/labels contain taxonomy terms. Never invents categories."""
+    rows = review_query(db, myntra_only=myntra_only, since=since, source=source).all()
+    if analyzed_only:
+        rows = [r for r in rows if r.analysis and r.analysis.is_valid_json]
+    denominator = len(rows)
+    buckets: dict[str, list[int]] = {name: [] for name in taxonomy}
+    for review in rows:
+        blob = _review_evidence_blob(review)
+        for name, terms in taxonomy.items():
+            if any(term in blob for term in terms):
+                buckets[name].append(review.id)
+    ranked = []
+    for name, ids in buckets.items():
+        if not ids:
+            continue
+        ranked.append(
+            {
+                "label": name,
+                "count": len(ids),
+                "percentage": pct(len(ids), denominator),
+                "denominator": denominator,
+                "review_ids": ids[:50],
+            }
+        )
+    ranked.sort(key=lambda item: (-int(item["count"]), str(item["label"])))
+    return ranked
+
+
+def purchase_signal_counts(
+    db: Session, *, myntra_only: bool = True, since: datetime | None = None, source: str | None = None
+) -> list[dict[str, Any]]:
+    rows = [
+        r
+        for r in review_query(db, myntra_only=myntra_only, since=since, source=source).all()
+        if r.analysis and r.analysis.is_valid_json
+    ]
+    counts: Counter[str] = Counter()
+    ids: dict[str, list[int]] = defaultdict(list)
+    for review in rows:
+        signal = review.analysis.purchase_signal or "none"
+        if signal == "none":
+            continue
+        counts[signal] += 1
+        ids[signal].append(review.id)
+    return [
+        {
+            "label": label,
+            "count": count,
+            "percentage": pct(count, len(rows)),
+            "denominator": len(rows),
+            "review_ids": ids[label][:50],
+        }
+        for label, count in counts.most_common()
+    ]
+
+
+def explicit_age_mentions(
+    db: Session, *, myntra_only: bool = True, since: datetime | None = None, source: str | None = None
+) -> list[dict[str, Any]]:
+    """Only count reviews that explicitly mention an age number with an age word."""
+    import re
+
+    pattern = re.compile(r"\b(?:i(?:'m| am)?|age)\s*(\d{2})\b|\b(\d{2})\s*(?:years? old|yr)\b", re.I)
+    rows = review_query(db, myntra_only=myntra_only, since=since, source=source).all()
+    hits = []
+    for review in rows:
+        text = f"{review.title or ''} {review.text or ''}"
+        match = pattern.search(text)
+        if not match:
+            continue
+        age = match.group(1) or match.group(2)
+        hits.append({"review_id": review.id, "age": int(age), "quote": text[:240]})
+    return hits

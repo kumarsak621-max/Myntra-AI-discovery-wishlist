@@ -112,6 +112,14 @@ class ReviewAnalysisSchema(BaseModel):
     behavioral_signals: list[BehavioralSignalItem] = Field(default_factory=list)
     product_category: list[str] = Field(default_factory=list)
     decision_factors: list[str] = Field(default_factory=list)
+    problems: list[str] = Field(default_factory=list)
+    wishlist_behavior: list[str] = Field(default_factory=list)
+    purchase_barriers: list[str] = Field(default_factory=list)
+    themes: list[str] = Field(default_factory=list)
+    segments: list[str] = Field(default_factory=list)
+    comparison_factors: list[str] = Field(default_factory=list)
+    external_information_seeking: list[str] = Field(default_factory=list)
+    social_validation: list[str] = Field(default_factory=list)
     root_cause: RootCauseItem | str = ""
     sentiment: Literal["positive", "negative", "mixed", "neutral"] = "neutral"
     evidence_strength: int = Field(default=1, ge=1, le=5)
@@ -126,7 +134,21 @@ class ReviewAnalysisSchema(BaseModel):
             return "implicit"
         return value
 
-    @field_validator("intent", "barriers", "uncertainties", "product_category", "decision_factors")
+    @field_validator(
+        "intent",
+        "barriers",
+        "uncertainties",
+        "product_category",
+        "decision_factors",
+        "problems",
+        "wishlist_behavior",
+        "purchase_barriers",
+        "themes",
+        "segments",
+        "comparison_factors",
+        "external_information_seeking",
+        "social_validation",
+    )
     @classmethod
     def _strip_empty(cls, value: list[str]) -> list[str]:
         cleaned = []

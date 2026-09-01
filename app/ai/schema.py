@@ -184,6 +184,41 @@ def try_validate_payload(
     if cleaned.get("purchase_barrier") and not cleaned.get("purchase_signal"):
         cleaned["purchase_signal"] = "hesitant"
         cleaned["purchase_hesitation"] = cleaned.get("purchase_hesitation") or "implicit"
+
+    def _as_list(value: Any) -> list[str]:
+        if not value:
+            return []
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        text = str(value).strip()
+        return [text] if text else []
+
+    def _merge(dest: str, extra: str) -> None:
+        added = _as_list(cleaned.get(extra))
+        if not added:
+            return
+        existing = _as_list(cleaned.get(dest))
+        cleaned[dest] = list(dict.fromkeys(existing + added))
+
+    _merge("barriers", "purchase_barriers")
+    _merge("intent", "wishlist_behavior")
+    _merge("intent", "themes")
+    _merge("decision_factors", "segments")
+    _merge("decision_factors", "comparison_factors")
+    if _as_list(cleaned.get("problems")) and not cleaned.get("root_cause"):
+        cleaned["root_cause"] = {"statement": _as_list(cleaned.get("problems"))[0]}
+    seeking = list(cleaned.get("information_seeking") or [])
+    for src in _as_list(cleaned.get("external_information_seeking")):
+        if isinstance(seeking, list):
+            seeking.append({"source": src, "basis": "inferred"})
+    if seeking:
+        cleaned["information_seeking"] = seeking
+    signals = list(cleaned.get("behavioral_signals") or [])
+    for sig in _as_list(cleaned.get("social_validation")):
+        if isinstance(signals, list):
+            signals.append({"signal": sig, "basis": "inferred"})
+    if signals:
+        cleaned["behavioral_signals"] = signals
     try:
         return validate_analysis_payload(cleaned, original_text), ""
     except (ValueError, ValidationError, json.JSONDecodeError, TypeError) as exc:

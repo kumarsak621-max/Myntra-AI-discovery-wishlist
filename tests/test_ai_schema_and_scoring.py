@@ -118,6 +118,34 @@ def test_compact_single_object_parses_without_results_array():
     assert items[0]["problem"] == "price too high"
 
 
+def test_extended_discovery_arrays_map_without_breaking_existing_fields():
+    from app.ai.schema import try_validate_payload
+
+    payload = {
+        "relevance": "medium",
+        "problems": ["fit uncertainty"],
+        "wishlist_behavior": ["save for later"],
+        "purchase_barriers": ["size"],
+        "uncertainties": ["Will it fit?"],
+        "themes": ["Fit & Size"],
+        "segments": ["fit-sensitive shoppers"],
+        "comparison_factors": ["price"],
+        "external_information_seeking": ["Google"],
+        "social_validation": ["reviews"],
+    }
+    parsed, error = try_validate_payload(payload, "Saved it for later because I am unsure about the size.")
+    assert error == ""
+    assert parsed is not None
+    assert parsed.root_cause.statement == "fit uncertainty"
+    assert "save for later" in parsed.intent
+    assert "Fit & Size" in parsed.intent
+    assert "size" in parsed.barriers
+    assert "fit-sensitive shoppers" in parsed.decision_factors
+    assert "price" in parsed.decision_factors
+    assert any(item.source == "Google" for item in parsed.information_seeking)
+    assert any(item.signal == "reviews" for item in parsed.behavioral_signals)
+
+
 def test_opportunity_score_is_deterministic():
     assert opportunity_score(5, 5, 5, 5, 5) == 3125
     assert opportunity_score(1, 1, 1, 1, 1) == 1

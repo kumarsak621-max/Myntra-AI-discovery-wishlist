@@ -209,9 +209,11 @@ Prints database path and counts, collector status, OpenRouter configuration (nev
 
 ## Dashboard
 
-The Streamlit dashboard includes Overview (default **Last 30 Days**), Live Data, Latest Reviews, User Problems, Wishlist Behavior, Purchase Barriers, Uncertainties, Themes, User Segments, Opportunity Matrix, Evidence Explorer, Collection History, and Discovery Report.
+The Streamlit dashboard is a single scrolling page: header, KPI cards, wishlist → purchase indicator, numbered discovery sections (problems through evidence explorer), the Product Manager assistant, and data limitations.
 
-Period can be switched to **All Time**. Last-30-day metrics use review timestamps only.
+The sidebar holds compact controls only (date range, source, rating, auto-refresh, analyze). There is no section-by-section navigation list.
+
+Period defaults to **Last 30 Days** and can be switched to **All Time**. Last-30-day metrics use review timestamps only.
 
 If nothing has been collected yet, the UI shows:
 
