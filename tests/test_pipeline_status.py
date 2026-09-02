@@ -1,4 +1,5 @@
-from dashboard.pipeline_status import derive_failed_reason, insights_status_for_analyze
+from dashboard.pipeline_status import derive_failed_reason, insights_status_for_analyze, is_omit_or_count_message
+from app.pipeline.analysis import format_ai_analysis_summary
 
 
 def test_insights_partial_when_analyze_partial():
@@ -38,3 +39,16 @@ def test_failed_reason_comes_from_pipeline_result():
 def test_failed_reason_defined_when_no_state():
     assert derive_failed_reason(steps=None) is None
     assert derive_failed_reason(steps={}) is None
+
+
+def test_omit_messages_are_detected():
+    assert is_omit_or_count_message("AI omitted this review from the batch response.")
+    assert is_omit_or_count_message("failed_after_retry: review_id=12. AI omitted this review from the batch response.")
+    assert is_omit_or_count_message("AI analysis: 149 / 150 reviews analyzed")
+    assert not is_omit_or_count_message("Malformed AI JSON: No JSON object found in AI response")
+
+
+def test_analysis_summary_for_partial_omit():
+    text = format_ai_analysis_summary(analyzed=9, failed=1, omitted_after_retry=1)
+    assert "9 / 10" in text
+    assert "1 review could not be analyzed after retry." in text

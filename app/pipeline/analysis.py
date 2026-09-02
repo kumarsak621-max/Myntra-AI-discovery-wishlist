@@ -6,7 +6,7 @@ import json
 import logging
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -38,6 +38,99 @@ class AnalysisRunResult:
     successful_batches: int = 0
     failed_batches: int = 0
     skipped_already_analyzed: int = 0
+    omitted_after_retry: int = 0
+    omitted_ids: list[int] = field(default_factory=list)
+
+
+@dataclass
+class BatchOutcome:
+    analyzed: int = 0
+    failed: int = 0
+    error: str = ""
+    http_status: int | None = None
+    successful_batches: int = 0
+    failed_batches: int = 0
+    omitted_after_retry: int = 0
+    omitted_ids: list[int] = field(default_factory=list)
+
+
+def format_ai_analysis_summary(
+    *,
+    analyzed: int,
+    failed: int = 0,
+    omitted_after_retry: int = 0,
+    selected: int | None = None,
+) -> str:
+    """Human-readable AI analysis counts. Never hides a genuine partial failure."""
+    analyzed_n = int(analyzed or 0)
+    failed_n = int(failed or 0)
+    omitted_n = int(omitted_after_retry or 0)
+    total = int(selected) if selected not in (None, 0) else analyzed_n + failed_n
+    if total <= 0 and analyzed_n <= 0 and failed_n <= 0:
+        return ""
+    if total <= 0:
+        total = analyzed_n + failed_n
+    lines = [f"AI analysis: {analyzed_n} / {total} reviews analyzed"]
+    if omitted_n:
+        noun = "review" if omitted_n == 1 else "reviews"
+        lines.append(f"{omitted_n} {noun} could not be analyzed after retry.")
+    elif failed_n:
+        noun = "review" if failed_n == 1 else "reviews"
+        lines.append(f"{failed_n} {noun} could not be analyzed.")
+    return "\n".join(lines)
+
+
+def _result_id_token(item: dict[str, Any]) -> str:
+    for key in ("id", "review_id", "source_review_id"):
+        value = item.get(key)
+        if value is None or value == "":
+            continue
+        token = str(value).strip()
+        if token:
+            return token
+    return ""
+
+
+def _index_batch_results(
+    items: list[dict[str, Any]],
+    chunk: list[Review],
+) -> dict[int, dict[str, Any]]:
+    """Map AI result objects onto reviews by stable ID. Never by array position."""
+    by_db_id = {str(review.id): review for review in chunk}
+    by_source = {
+        str(review.source_review_id).strip(): review
+        for review in chunk
+        if str(review.source_review_id or "").strip()
+    }
+    assigned: dict[int, dict[str, Any]] = {}
+    seen_tokens: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        token = _result_id_token(item)
+        if not token:
+            continue
+        if token in seen_tokens:
+            logger.warning("Ignoring duplicate AI result for review id %s", token)
+            continue
+        seen_tokens.add(token)
+        review = by_db_id.get(token) or by_source.get(token)
+        if review is None:
+            logger.warning("Ignoring unknown AI review id %s", token)
+            continue
+        assigned[int(review.id)] = item
+    if len(chunk) == 1 and not assigned and items:
+        only = items[0]
+        if isinstance(only, dict) and not _result_id_token(only):
+            assigned[int(chunk[0].id)] = only
+    return assigned
+
+
+def _omit_message(review: Review, *, after_retry: bool) -> str:
+    rid = int(review.id or 0)
+    if after_retry:
+        return f"failed_after_retry: review_id={rid}. AI omitted this review from the batch response."
+    return f"omitted: review_id={rid}. AI omitted this review from the batch response."
 
 
 def _original_blob(review: Review) -> str:
@@ -211,6 +304,19 @@ def _prompt_items(reviews: Sequence[Review], max_chars: int) -> list[dict[str, A
     return items
 
 
+def _merge_outcomes(left: BatchOutcome, right: BatchOutcome) -> BatchOutcome:
+    return BatchOutcome(
+        analyzed=left.analyzed + right.analyzed,
+        failed=left.failed + right.failed,
+        error=right.error or left.error,
+        http_status=right.http_status or left.http_status,
+        successful_batches=left.successful_batches + right.successful_batches,
+        failed_batches=left.failed_batches + right.failed_batches,
+        omitted_after_retry=left.omitted_after_retry + right.omitted_after_retry,
+        omitted_ids=[*left.omitted_ids, *right.omitted_ids],
+    )
+
+
 def _analyze_chunk(
     db: Session,
     provider: AIProvider,
@@ -218,37 +324,35 @@ def _analyze_chunk(
     *,
     max_chars: int,
     shrink_depth: int = 0,
-) -> tuple[int, int, str, int | None, int, int]:
-    """Returns analyzed, failed, error, http_status, successful_batches, failed_batches."""
-    analyzed, failed, error, http_status = _analyze_batch(db, provider, chunk, max_chars=max_chars)
-    if http_status == 402:
-        return analyzed, failed, error, http_status, 0, 1
+) -> BatchOutcome:
+    outcome = _analyze_batch(db, provider, chunk, max_chars=max_chars, retry_missing=True)
+    if outcome.http_status == 402:
+        outcome.successful_batches = 0
+        outcome.failed_batches = 1
+        return outcome
     if (
-        analyzed == 0
-        and failed == len(chunk)
+        outcome.analyzed == 0
+        and outcome.failed == len(chunk)
         and (
-            http_status in {400, 413}
-            or "Malformed AI JSON" in (error or "")
+            outcome.http_status in {400, 413}
+            or "Malformed AI JSON" in (outcome.error or "")
         )
         and len(chunk) > 1
         and shrink_depth < 2
     ):
         mid = max(1, len(chunk) // 2)
         left = _analyze_chunk(db, provider, chunk[:mid], max_chars=max_chars, shrink_depth=shrink_depth + 1)
-        if left[3] == 402:
+        if left.http_status == 402:
             return left
         right = _analyze_chunk(db, provider, chunk[mid:], max_chars=max_chars, shrink_depth=shrink_depth + 1)
-        return (
-            left[0] + right[0],
-            left[1] + right[1],
-            right[2] or left[2],
-            right[3] or left[3],
-            left[4] + right[4],
-            left[5] + right[5],
-        )
-    if analyzed:
-        return analyzed, failed, error, http_status, 1, 1 if failed else 0
-    return analyzed, failed, error, http_status, 0, 1
+        return _merge_outcomes(left, right)
+    if outcome.analyzed:
+        outcome.successful_batches = 1
+        outcome.failed_batches = 1 if outcome.failed else 0
+        return outcome
+    outcome.successful_batches = 0
+    outcome.failed_batches = 1
+    return outcome
 
 
 def analyze_review(provider: AIProvider, review: Review) -> tuple[Any, str, str]:
@@ -273,9 +377,9 @@ def _analyze_batch(
     chunk: list[Review],
     *,
     max_chars: int,
-) -> tuple[int, int, str, int | None]:
+    retry_missing: bool = True,
+) -> BatchOutcome:
     user = analysis_batch_user_prompt(_prompt_items(chunk, max_chars))
-    http_status: int | None = None
     try:
         raw = provider.complete_json(system=SYSTEM_PROMPT, user=user)
     except AIError as exc:
@@ -283,16 +387,16 @@ def _analyze_batch(
         http_status = getattr(exc, "http_status", None)
         logger.warning("AI batch failed (%s reviews): %s", len(chunk), error)
         if http_status == 402:
-            return 0, 0, error, http_status
+            return BatchOutcome(error=error, http_status=http_status)
         for review in chunk:
             persist_analysis(db, review, None, "", error, provider, http_status=http_status)
-        return 0, len(chunk), error, http_status
+        return BatchOutcome(failed=len(chunk), error=error, http_status=http_status)
     except Exception as exc:  # never crash the pipeline on one batch
         error = redact_secrets(f"Unexpected analysis failure: {exc}")
         logger.exception("Unexpected analysis failure for batch of %s reviews", len(chunk))
         for review in chunk:
             persist_analysis(db, review, None, "", error, provider)
-        return 0, len(chunk), error, None
+        return BatchOutcome(failed=len(chunk), error=error)
 
     items, parse_error = parse_batch_payload(raw)
     if parse_error:
@@ -307,41 +411,46 @@ def _analyze_batch(
             items, parse_error = parse_batch_payload(raw)
         except AIError as exc:
             if getattr(exc, "http_status", None) == 402:
-                return 0, 0, redact_secrets(str(exc)), 402
+                return BatchOutcome(error=redact_secrets(str(exc)), http_status=402)
             parse_error = parse_error or redact_secrets(str(exc))
         except Exception as exc:
             logger.exception("JSON repair retry failed for batch of %s reviews", len(chunk))
             parse_error = parse_error or redact_secrets(f"Unexpected analysis failure: {exc}")
     if parse_error:
         error = redact_secrets(parse_error)
+        omitted_ids = []
         for review in chunk:
-            persist_analysis(db, review, None, raw, error, provider)
-        return 0, len(chunk), error, None
+            stored_error = error
+            if not retry_missing:
+                stored_error = f"failed_after_retry: review_id={int(review.id)}. {error}"
+                omitted_ids.append(int(review.id))
+            persist_analysis(db, review, None, raw, stored_error, provider)
+        return BatchOutcome(
+            failed=len(chunk),
+            error=stored_error if omitted_ids else error,
+            omitted_after_retry=len(omitted_ids),
+            omitted_ids=omitted_ids,
+        )
 
-    by_id: dict[str, dict[str, Any]] = {}
-    anonymous: list[dict[str, Any]] = []
-    for item in items:
-        token = str(item.get("id") or item.get("source_review_id") or "").strip()
-        if token:
-            by_id[token] = item
-        else:
-            anonymous.append(item)
+    assigned = _index_batch_results(items, chunk)
+    expected_ids = {int(review.id) for review in chunk}
+    returned_ids = set(assigned.keys())
+    missing = [review for review in chunk if int(review.id) not in returned_ids]
+    logger.info(
+        "AI batch matching expected=%s returned=%s missing=%s",
+        len(expected_ids),
+        len(returned_ids),
+        [int(review.id) for review in missing],
+    )
 
     analyzed = 0
     failed = 0
     last_error = ""
+    omitted_after_retry = 0
+    omitted_ids: list[int] = []
     for review in chunk:
-        item = by_id.pop(str(review.id), None)
-        source_id = str(review.source_review_id or "").strip()
-        if item is None and source_id:
-            item = by_id.pop(source_id, None)
-        if item is None and anonymous:
-            item = anonymous.pop(0)
+        item = assigned.get(int(review.id))
         if item is None:
-            error = "AI omitted this review from the batch response."
-            persist_analysis(db, review, None, raw, error, provider)
-            failed += 1
-            last_error = error
             continue
         parsed, error = try_validate_payload(item, _original_blob(review))
         persist_analysis(db, review, parsed, raw, error, provider)
@@ -350,7 +459,47 @@ def _analyze_batch(
         else:
             failed += 1
             last_error = error or "AI response failed schema validation."
-    return analyzed, failed, last_error, None
+
+    if missing and retry_missing:
+        for review in missing:
+            inner = _analyze_batch(
+                db, provider, [review], max_chars=max_chars, retry_missing=False
+            )
+            if inner.http_status == 402:
+                return BatchOutcome(
+                    analyzed=analyzed,
+                    failed=failed,
+                    error=inner.error,
+                    http_status=402,
+                    omitted_after_retry=omitted_after_retry,
+                    omitted_ids=omitted_ids,
+                )
+            analyzed += inner.analyzed
+            failed += inner.failed
+            if inner.omitted_after_retry:
+                omitted_after_retry += inner.omitted_after_retry
+                omitted_ids.extend(inner.omitted_ids)
+            elif inner.failed:
+                omitted_after_retry += inner.failed
+                omitted_ids.append(int(review.id))
+            if inner.error:
+                last_error = inner.error
+    elif missing:
+        for review in missing:
+            error = _omit_message(review, after_retry=True)
+            persist_analysis(db, review, None, raw, error, provider)
+            failed += 1
+            omitted_after_retry += 1
+            omitted_ids.append(int(review.id))
+            last_error = error
+
+    return BatchOutcome(
+        analyzed=analyzed,
+        failed=failed,
+        error=last_error,
+        omitted_after_retry=omitted_after_retry,
+        omitted_ids=omitted_ids,
+    )
 
 
 def analyze_new_reviews(
@@ -434,27 +583,27 @@ def analyze_new_reviews(
         for batch_index, chunk in enumerate(chunks, start=1):
             if rate > 0:
                 time.sleep(rate)
-            analyzed, failed, error, http_status, ok_batches, bad_batches = _analyze_chunk(
-                db, provider, chunk, max_chars=max_chars
-            )
-            result.analyzed += analyzed
-            result.failed += failed
-            result.batches_processed += max(1, ok_batches + bad_batches)
-            result.successful_batches += ok_batches
-            result.failed_batches += bad_batches
-            if http_status == 402:
-                result.last_error = error
-                result.last_http_status = http_status
+            outcome = _analyze_chunk(db, provider, chunk, max_chars=max_chars)
+            result.analyzed += outcome.analyzed
+            result.failed += outcome.failed
+            result.omitted_after_retry += outcome.omitted_after_retry
+            result.omitted_ids.extend(outcome.omitted_ids)
+            result.batches_processed += max(1, outcome.successful_batches + outcome.failed_batches)
+            result.successful_batches += outcome.successful_batches
+            result.failed_batches += outcome.failed_batches
+            if outcome.http_status == 402:
+                result.last_error = outcome.error
+                result.last_http_status = outcome.http_status
                 db.commit()
                 break
             result.processed += len(chunk)
             processed += len(chunk)
-            analyzed_total += analyzed
-            failed_total += failed
-            if error:
-                result.last_error = error
-            if http_status:
-                result.last_http_status = http_status
+            analyzed_total += outcome.analyzed
+            failed_total += outcome.failed
+            if outcome.error:
+                result.last_error = outcome.error
+            if outcome.http_status:
+                result.last_http_status = outcome.http_status
             db.commit()
             pending_left = max(0, result.selected - analyzed_total - failed_total)
             percent = int(round(100 * analyzed_total / max(1, result.selected)))
@@ -471,12 +620,20 @@ def analyze_new_reviews(
                         "analyzed_total": analyzed_total,
                         "pending_total": pending_left,
                         "failed_total": failed_total,
+                        "omitted_after_retry": result.omitted_after_retry,
                         "batch_index": batch_index,
                         "batch_total": batch_total,
                         "percent": percent,
-                        "message": error,
+                        "message": outcome.error,
                     }
                 )
+
+        if result.omitted_after_retry:
+            result.last_error = format_ai_analysis_summary(
+                analyzed=result.analyzed,
+                failed=result.failed,
+                omitted_after_retry=result.omitted_after_retry,
+            ) or result.last_error
 
         db.commit()
         if progress:
@@ -493,6 +650,7 @@ def analyze_new_reviews(
                     "batches_processed": result.batches_processed,
                     "successful_batches": result.successful_batches,
                     "failed_batches": result.failed_batches,
+                    "omitted_after_retry": result.omitted_after_retry,
                     "message": result.last_error,
                 }
             )

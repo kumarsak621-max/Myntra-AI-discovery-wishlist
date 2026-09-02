@@ -117,6 +117,8 @@ Rules:
 - wishlist_behavior must ALWAYS be a JSON array of strings. If there is no evidence, return []. Never return an empty string.
 - purchase_barriers, uncertainties, themes, and segments must ALWAYS be JSON arrays of strings. Use [] when evidence is absent.
 - Never return "" or null for a list field.
+- Return exactly one results[] object for every REVIEW ID supplied below.
+- Copy the supplied REVIEW ID into each object's "id" field. Do not skip reviews. Do not invent IDs.
 - Short phrases only. Do not invent. Do not assume wishlist unless the text supports it.
 - Public reviews are proxy evidence only, not conversion events.
 

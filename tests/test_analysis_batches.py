@@ -289,3 +289,156 @@ def test_insights_are_blocked_when_analysis_fails(db, monkeypatch):
     assert result.analyzed == 0
     assert result.failed == 5
     assert called["themes"] == 0
+
+
+def _ten_reviews(db):
+    return [
+        _insert(db, f"batch-{i}", f"Wishlisted a dress {i}. Size chart is missing so I did not buy.")
+        for i in range(10)
+    ]
+
+
+def test_ten_returned_is_success(db):
+    rows = _ten_reviews(db)
+
+    def complete(*, system, user):
+        ids = re.findall(r"REVIEW ID: (\S+)", user)
+        return json.dumps({"results": [_ok_item(i) for i in ids]})
+
+    provider = FakeProvider(complete, _settings(ai_request_batch_size=10))
+    result = analyze_new_reviews(db, provider=provider, limit=10)
+    db.commit()
+    assert result.analyzed == 10
+    assert result.failed == 0
+    assert result.omitted_after_retry == 0
+    assert len(provider.calls) == 1
+    assert all(row.analysis.status == "analyzed" for row in rows)
+
+
+def test_nine_of_ten_retries_only_missing_and_recovers(db):
+    rows = _ten_reviews(db)
+    omitted = rows[-1]
+
+    def complete(*, system, user):
+        ids = re.findall(r"REVIEW ID: (\S+)", user)
+        if len(ids) > 1:
+            return json.dumps({"results": [_ok_item(i) for i in ids if i != str(omitted.id)]})
+        return json.dumps({"results": [_ok_item(i) for i in ids]})
+
+    provider = FakeProvider(complete, _settings(ai_request_batch_size=10))
+    result = analyze_new_reviews(db, provider=provider, limit=10)
+    db.commit()
+    assert [len(re.findall(r"REVIEW ID: (\S+)", call)) for call in provider.calls][0] == 10
+    assert any(len(re.findall(r"REVIEW ID: (\S+)", call)) == 1 for call in provider.calls)
+    assert str(omitted.id) in provider.calls[-1]
+    assert result.analyzed == 10
+    assert result.failed == 0
+    assert omitted.analysis.status == "analyzed"
+
+
+def test_missing_review_fails_after_retry_is_partial(db):
+    rows = _ten_reviews(db)
+    omitted = rows[-1]
+
+    def complete(*, system, user):
+        ids = re.findall(r"REVIEW ID: (\S+)", user)
+        if len(ids) > 1:
+            return json.dumps({"results": [_ok_item(i) for i in ids if i != str(omitted.id)]})
+        return json.dumps({"results": [_ok_item("not-this-review")]})
+
+    provider = FakeProvider(complete, _settings(ai_request_batch_size=10))
+    result = analyze_new_reviews(db, provider=provider, limit=10)
+    db.commit()
+    assert result.analyzed == 9
+    assert result.failed == 1
+    assert result.omitted_after_retry == 1
+    assert omitted.id in result.omitted_ids
+    assert omitted.analysis.status == "failed"
+    assert "failed_after_retry" in (omitted.analysis.parse_error or "")
+    assert str(omitted.id) in (omitted.analysis.parse_error or "")
+    assert "9 / 10" in (result.last_error or "")
+    assert "after retry" in (result.last_error or "").lower()
+    assert all(row.analysis.status == "analyzed" for row in rows[:-1])
+
+
+def test_all_reviews_fail_when_no_matching_ids(db):
+    rows = [_insert(db, f"all-fail-{i}", "Wishlisted a kurta. Size chart is missing.") for i in range(2)]
+
+    def complete(*, system, user):
+        return json.dumps({"results": [_ok_item("unknown-id")]})
+
+    provider = FakeProvider(complete, _settings(ai_request_batch_size=2))
+    result = analyze_new_reviews(db, provider=provider, limit=2)
+    db.commit()
+    assert result.analyzed == 0
+    assert result.failed == 2
+    assert all(row.analysis.status == "failed" for row in rows)
+
+
+def test_malformed_json_does_not_crash_batch(db):
+    row = _insert(db, "bad-json", "Wishlisted sandals but sizing is confusing so I did not order.")
+
+    def complete(*, system, user):
+        return "definitely not json {"
+
+    provider = FakeProvider(complete, _settings(ai_request_batch_size=1))
+    result = analyze_new_reviews(db, provider=provider, limit=1)
+    db.commit()
+    assert result.analyzed == 0
+    assert result.failed == 1
+    assert row.analysis.status == "failed"
+    assert "Malformed AI JSON" in (row.analysis.parse_error or "")
+
+
+def test_duplicate_review_ids_use_first_and_retry_missing(db):
+    rows = _ten_reviews(db)
+    omitted = rows[-1]
+    first = rows[0]
+
+    def complete(*, system, user):
+        ids = re.findall(r"REVIEW ID: (\S+)", user)
+        if len(ids) > 1:
+            payload = [_ok_item(ids[0]), _ok_item(ids[0])] + [_ok_item(i) for i in ids[1:-1]]
+            return json.dumps({"results": payload})
+        return json.dumps({"results": [_ok_item(i) for i in ids]})
+
+    provider = FakeProvider(complete, _settings(ai_request_batch_size=10))
+    result = analyze_new_reviews(db, provider=provider, limit=10)
+    db.commit()
+    assert result.analyzed == 10
+    assert first.analysis.status == "analyzed"
+    assert omitted.analysis.status == "analyzed"
+    assert any(len(re.findall(r"REVIEW ID: (\S+)", call)) == 1 for call in provider.calls)
+
+
+def test_unknown_review_id_is_ignored_and_missing_retried(db):
+    rows = [_insert(db, f"unk-{i}", "Wishlisted jeans. Not sure they will fit.") for i in range(2)]
+    missing = rows[1]
+
+    def complete(*, system, user):
+        ids = re.findall(r"REVIEW ID: (\S+)", user)
+        if len(ids) > 1:
+            return json.dumps({"results": [_ok_item(ids[0]), _ok_item("999999")]})
+        return json.dumps({"results": [_ok_item(i) for i in ids]})
+
+    provider = FakeProvider(complete, _settings(ai_request_batch_size=2))
+    result = analyze_new_reviews(db, provider=provider, limit=2)
+    db.commit()
+    assert result.analyzed == 2
+    assert missing.analysis.status == "analyzed"
+    assert rows[0].analysis.status == "analyzed"
+
+
+def test_review_id_field_alias_is_matched(db):
+    row = _insert(db, "alias-id", "Wishlisted a jacket. Colour looks different in photos.")
+
+    def complete(*, system, user):
+        ids = re.findall(r"REVIEW ID: (\S+)", user)
+        item = _ok_item(ids[0])
+        item["review_id"] = item.pop("id")
+        return json.dumps({"results": [item]})
+
+    result = analyze_new_reviews(db, provider=FakeProvider(complete, _settings(ai_request_batch_size=1)), limit=1)
+    db.commit()
+    assert result.analyzed == 1
+    assert row.analysis.status == "analyzed"

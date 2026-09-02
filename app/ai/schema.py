@@ -257,7 +257,7 @@ def validate_analysis_payload(payload: dict[str, Any], original_text: str) -> Re
 def try_validate_payload(
     payload: dict[str, Any], original_text: str
 ) -> tuple[ReviewAnalysisSchema | None, str]:
-    cleaned = {key: value for key, value in payload.items() if key not in {"id", "source_review_id"}}
+    cleaned = {key: value for key, value in payload.items() if key not in {"id", "review_id", "source_review_id"}}
 
     def _meaningful(value: Any) -> str:
         return stored_category_text(value)

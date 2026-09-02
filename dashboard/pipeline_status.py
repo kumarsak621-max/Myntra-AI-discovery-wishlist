@@ -5,6 +5,18 @@ from __future__ import annotations
 from typing import Any
 
 
+def is_omit_or_count_message(text: str | None) -> bool:
+    value = str(text or "").strip().lower()
+    if not value:
+        return False
+    return (
+        value.startswith("ai analysis:")
+        or "omitted this review" in value
+        or value.startswith("failed_after_retry")
+        or value.startswith("omitted:")
+    )
+
+
 def insights_status_for_analyze(analyze_step: str, analyzed: int) -> str:
     """Map analyze outcome + stored analyzed count to an Insights stage."""
     analyzed = int(analyzed or 0)

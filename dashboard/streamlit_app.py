@@ -66,8 +66,9 @@ from dashboard.insights import (
     why_this_matters,
     wishlist_conversion_copy,
 )
-from dashboard.pipeline_status import derive_failed_reason, insights_status_for_analyze
+from dashboard.pipeline_status import derive_failed_reason, insights_status_for_analyze, is_omit_or_count_message
 from dashboard.questions import DISCOVERY_QUESTIONS
+from app.pipeline.analysis import format_ai_analysis_summary
 
 LOGGER = logging.getLogger("myntra.discovery")
 
@@ -536,7 +537,7 @@ def render() -> None:
 
     _header(cfg, data["freshness"], period, diag)
     _actions(ai_ok)
-    _pipeline_status_panel()
+    _pipeline_status_panel(diag)
     _auto_sync_ui()
 
     if stored == 0:
@@ -746,8 +747,9 @@ def _live_status(data: dict, diag: dict) -> None:
         "Pending stored reviews outside the sample are not treated as analyzed. "
         "Progress updates after each completed batch."
     )
-    if diag.get("last_analysis_error"):
-        st.error(diag.get("last_analysis_error"))
+    last_err = str(diag.get("last_analysis_error") or "")
+    if last_err and not is_omit_or_count_message(last_err):
+        st.error(last_err)
     daily = data.get("daily") or []
     if daily:
         st.caption("Reviews by day (review timestamps, not collection time)")
@@ -1560,7 +1562,7 @@ def _pipeline_mark(value: str) -> str:
     if value == "no_new":
         return "✓ NO NEW REVIEWS"
     if value == "partial":
-        return "PARTIAL"
+        return "⚠ PARTIAL"
     if value == "failed":
         return "FAILED"
     if value == "insufficient":
@@ -1622,7 +1624,7 @@ def _pipeline_from_last_run() -> dict:
         db.close()
 
 
-def _pipeline_status_panel() -> None:
+def _pipeline_status_panel(diag: dict | None = None) -> None:
     failed_reason = None
     pipeline_result = st.session_state.get("pipeline_result") or {}
     steps = (
@@ -1649,9 +1651,42 @@ def _pipeline_status_panel() -> None:
     ):
         mark = _pipeline_mark(steps.get(key, "pending"))
         st.markdown(f'<div class="pipeline-row">{label} {mark}</div>', unsafe_allow_html=True)
-    if failed_reason and steps.get("analyze") in {"failed", "partial"}:
+    last_analysis = st.session_state.get("last_analysis") or {}
+    diag = diag or {}
+    analyzed_n = int(
+        last_analysis.get("analyzed")
+        if last_analysis.get("analyzed") is not None
+        else (pipeline_result.get("analyzed") if pipeline_result.get("analyzed") is not None else (diag.get("sample_analyzed") or diag.get("analyzed_reviews") or 0))
+    )
+    failed_n = int(
+        last_analysis.get("failed")
+        if last_analysis.get("failed") is not None
+        else (pipeline_result.get("failed") if pipeline_result.get("failed") is not None else (diag.get("sample_failed") or diag.get("failed_reviews") or 0))
+    )
+    omitted_n = int(last_analysis.get("omitted_after_retry") or pipeline_result.get("omitted_after_retry") or 0)
+    selected_n = int(diag.get("selected_reviews") or last_analysis.get("selected") or 0)
+    display_analyzed = int(diag.get("sample_analyzed") or analyzed_n or 0)
+    display_total = selected_n or (display_analyzed + failed_n)
+    if display_total or display_analyzed or failed_n:
+        st.markdown("**AI ANALYSIS**")
+        summary = format_ai_analysis_summary(
+            analyzed=display_analyzed,
+            failed=failed_n,
+            omitted_after_retry=omitted_n,
+            selected=display_total if display_total else None,
+        )
+        if summary:
+            for line in summary.splitlines():
+                st.write(line)
+    if failed_reason and steps.get("analyze") == "failed":
         st.error(failed_reason)
     elif failed_reason and (steps.get("play") == "failed" or steps.get("apple") == "failed"):
+        st.error(failed_reason)
+    elif (
+        failed_reason
+        and steps.get("analyze") == "partial"
+        and not is_omit_or_count_message(failed_reason)
+    ):
         st.error(failed_reason)
 
 
@@ -1731,11 +1766,17 @@ def _run_full_discovery(ai_ok: bool) -> None:
                 "failed_reason": result.last_error or None,
                 "analyzed": result.analyzed,
                 "failed": result.failed,
+                "omitted_after_retry": result.omitted_after_retry,
+                "selected": result.selected,
             }
             _load_bundle.clear()
             st.session_state["last_analysis"] = {
                 "status": "Connected" if result.analyzed else "Failed",
                 "message": result.last_error or f"Analyzed {result.analyzed}, failed {result.failed}.",
+                "analyzed": result.analyzed,
+                "failed": result.failed,
+                "omitted_after_retry": result.omitted_after_retry,
+                "selected": result.selected,
                 "batches_processed": result.batches_processed,
                 "successful_batches": result.successful_batches,
                 "failed_batches": result.failed_batches,
@@ -1842,10 +1883,16 @@ def _run_analyze(*, only_failed: bool = False) -> None:
             "failed_reason": result.last_error or None,
             "analyzed": result.analyzed,
             "failed": result.failed,
+            "omitted_after_retry": result.omitted_after_retry,
+            "selected": result.selected,
         }
         st.session_state["last_analysis"] = {
             "status": "Connected" if result.analyzed else "Configured",
             "message": result.last_error or f"Analyzed {result.analyzed}, failed {result.failed}.",
+            "analyzed": result.analyzed,
+            "failed": result.failed,
+            "omitted_after_retry": result.omitted_after_retry,
+            "selected": result.selected,
             "batches_processed": result.batches_processed,
             "successful_batches": result.successful_batches,
             "failed_batches": result.failed_batches,
