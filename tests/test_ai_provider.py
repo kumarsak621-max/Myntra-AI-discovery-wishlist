@@ -77,6 +77,26 @@ def test_gemini_openrouter_skips_json_object_mode(monkeypatch):
     assert client.calls[0]["json"]["max_tokens"] != 65535
 
 
+def test_openrouter_reads_reasoning_when_content_empty():
+    from app.ai.provider import _content_from_response
+
+    response = FakeResponse(
+        200,
+        payload={
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning": '{"results": [{"id": "1", "problem": "fit"}]}',
+                    }
+                }
+            ]
+        },
+    )
+    text, _usage = _content_from_response(response, max_tokens=2000)
+    assert "fit" in text
+
+
 def test_json_mode_400_retries_without_response_format(monkeypatch):
     client = FakeClient(
         [

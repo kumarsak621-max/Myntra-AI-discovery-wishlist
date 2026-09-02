@@ -15,10 +15,66 @@ def test_extract_json_from_fences():
     assert payload["relevance"] == "high"
 
 
+def test_extract_pure_and_fenced_wishlist_behavior():
+    from app.ai.schema import extract_json_object, try_validate_payload
+
+    pure = '{"wishlist_behavior": [], "relevance": "low"}'
+    payload = extract_json_object(pure)
+    assert payload["wishlist_behavior"] == []
+
+    fenced = """```json
+{
+  "wishlist_behavior": []
+}
+```"""
+    parsed, error = try_validate_payload(extract_json_object(fenced), "Nice app")
+    assert error == ""
+    assert parsed is not None
+    assert parsed.wishlist_behavior == []
+
+
 def test_malformed_json_is_handled():
     parsed, error = try_validate_analysis("not json at all", "hello")
     assert parsed is None
     assert "Malformed AI JSON" in error
+
+
+def test_extract_json_from_prose_preamble():
+    from app.ai.schema import extract_json_object, parse_batch_payload
+
+    raw = (
+        "Here is the analysis:\n"
+        '{"results": [{"id": "12", "problem": "size chart missing", "wishlist_behavior": []}]}\n'
+        "Hope this helps."
+    )
+    payload = extract_json_object(raw)
+    assert payload["results"][0]["id"] == "12"
+    items, error = parse_batch_payload(raw)
+    assert error == ""
+    assert items[0]["problem"] == "size chart missing"
+
+
+def test_extract_json_trailing_commas_and_unclosed_fence():
+    from app.ai.schema import parse_batch_payload
+
+    raw = """```json
+{"results": [
+  {"id": "1", "problem": "returns", "wishlist_behavior": [],},
+]}
+"""
+    items, error = parse_batch_payload(raw)
+    assert error == ""
+    assert items[0]["id"] == "1"
+
+
+def test_extract_truncated_results_json_is_closed():
+    from app.ai.schema import parse_batch_payload
+
+    raw = '{"results": [{"id": "9", "problem": "delivery delay"'
+    items, error = parse_batch_payload(raw)
+    assert error == ""
+    assert items[0]["id"] == "9"
+    assert items[0]["problem"] == "delivery delay"
 
 
 def test_batch_payload_extracts_results():

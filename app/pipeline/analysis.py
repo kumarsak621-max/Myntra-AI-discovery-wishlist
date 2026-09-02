@@ -226,7 +226,10 @@ def _analyze_chunk(
     if (
         analyzed == 0
         and failed == len(chunk)
-        and http_status in {400, 413}
+        and (
+            http_status in {400, 413}
+            or "Malformed AI JSON" in (error or "")
+        )
         and len(chunk) > 1
         and shrink_depth < 2
     ):
@@ -292,6 +295,23 @@ def _analyze_batch(
         return 0, len(chunk), error, None
 
     items, parse_error = parse_batch_payload(raw)
+    if parse_error:
+        retry_user = (
+            user
+            + "\n\nIMPORTANT: Your previous reply was not valid JSON. "
+            "Reply with ONLY a JSON object. The first character must be {. "
+            'Shape: {"results":[{...}]}. One results[] object per review. No markdown.'
+        )
+        try:
+            raw = provider.complete_json(system=SYSTEM_PROMPT, user=retry_user)
+            items, parse_error = parse_batch_payload(raw)
+        except AIError as exc:
+            if getattr(exc, "http_status", None) == 402:
+                return 0, 0, redact_secrets(str(exc)), 402
+            parse_error = parse_error or redact_secrets(str(exc))
+        except Exception as exc:
+            logger.exception("JSON repair retry failed for batch of %s reviews", len(chunk))
+            parse_error = parse_error or redact_secrets(f"Unexpected analysis failure: {exc}")
     if parse_error:
         error = redact_secrets(parse_error)
         for review in chunk:

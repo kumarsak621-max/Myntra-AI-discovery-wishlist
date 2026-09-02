@@ -231,22 +231,44 @@ AIProvider = OpenRouterAIService
 
 
 def _message_content(message: Any) -> str:
-    """Read OpenRouter chat content from string or multimodal list parts."""
+    """Read OpenRouter chat content from string, multimodal parts, or reasoning fields."""
     if not isinstance(message, dict):
         return ""
-    content = message.get("content")
-    if isinstance(content, str) and content.strip():
-        return content.strip()
-    if isinstance(content, list):
-        parts: list[str] = []
+
+    def _from_parts(content: Any) -> str:
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        if not isinstance(content, list):
+            return ""
+        visible: list[str] = []
+        thoughts: list[str] = []
         for item in content:
             if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                parts.append(str(item.get("text") or item.get("content") or ""))
-        joined = "".join(parts).strip()
+                visible.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("type") or "").lower()
+            piece = str(item.get("text") or item.get("content") or "")
+            if kind in {"thought", "reasoning"}:
+                thoughts.append(piece)
+            else:
+                visible.append(piece)
+        joined = "".join(visible).strip()
         if joined:
             return joined
+        return "".join(thoughts).strip()
+
+    text = _from_parts(message.get("content"))
+    if text:
+        return text
+    for key in ("reasoning", "reasoning_content"):
+        extra = message.get(key)
+        if isinstance(extra, str) and extra.strip():
+            return extra.strip()
+        nested = _from_parts(extra)
+        if nested:
+            return nested
     return ""
 
 
@@ -324,6 +346,10 @@ def _content_from_response(
     if refusal:
         raise AIError(f"OpenRouter analysis failed: model refused the request. {_redact(str(refusal))[:200]}")
     text = _message_content(message)
+    if not text:
+        choice = choices[0] or {}
+        if isinstance(choice.get("text"), str) and choice["text"].strip():
+            text = choice["text"].strip()
     if not text:
         raise AIError("OpenRouter returned empty content.")
     usage_raw = payload.get("usage") if isinstance(payload, dict) else None

@@ -66,7 +66,7 @@ from dashboard.insights import (
     why_this_matters,
     wishlist_conversion_copy,
 )
-from dashboard.questions import DISCOVERY_QUESTIONS
+from dashboard.pipeline_status import derive_failed_reason, insights_status_for_analyze
 
 LOGGER = logging.getLogger("myntra.discovery")
 
@@ -854,8 +854,12 @@ def _wishlist_intelligence(data: dict, analyzed: int) -> None:
 
 
 def _root_causes(data: dict, analyzed: int) -> None:
-    st.markdown('<div class="section-h">ROOT CAUSE</div>', unsafe_allow_html=True)
-    st.caption("Connects user behavior → problem → uncertainty/barrier → purchase hesitation → business metric.")
+    st.markdown('<div class="section-h">ROOT CAUSE ANALYSIS</div>', unsafe_allow_html=True)
+    st.caption(
+        "User Behavior → User Problem → Uncertainty / Barrier → Purchase Hesitation → "
+        "Wishlist → Purchase Impact. Derived from stored review evidence, not hardcoded. "
+        "Public reviews do not directly measure wishlist-to-purchase conversion."
+    )
     derived = derive_root_cause(
         analyzed=analyzed,
         problems=data.get("problems") or [],
@@ -867,13 +871,20 @@ def _root_causes(data: dict, analyzed: int) -> None:
     st.markdown(f"**{derived['statement']}**")
     chain = derived.get("chain") or {}
     if derived.get("supported") and chain:
-        st.caption(
-            f"Behavior: {chain.get('user_behavior')} → "
-            f"Problem: {chain.get('problem')} → "
-            f"Barrier/uncertainty: {chain.get('uncertainty_or_barrier')} → "
-            f"Hesitation reviews: {chain.get('purchase_hesitation')} → "
-            f"Metric: {chain.get('business_metric')}"
+        st.markdown(
+            f"**User Behavior:** {chain.get('user_behavior')}  \n"
+            f"**User Problem:** {chain.get('problem')}  \n"
+            f"**Uncertainty / Barrier:** {chain.get('uncertainty_or_barrier')}  \n"
+            f"**Purchase Hesitation:** {chain.get('purchase_hesitation')} supporting reviews  \n"
+            f"**Wishlist → Purchase Impact:** {chain.get('business_metric')}"
         )
+        evidence_ids = []
+        if data.get("problems"):
+            evidence_ids = data["problems"][0].get("review_ids") or []
+        elif data.get("barriers"):
+            evidence_ids = data["barriers"][0].get("review_ids") or []
+        if evidence_ids:
+            _view_evidence(evidence_ids, title="View supporting reviews")
     rows = data.get("root_causes") or []
     if not rows:
         if not derived.get("supported"):
@@ -1589,30 +1600,44 @@ def _pipeline_from_last_run() -> dict:
         errors = notes.get("errors") or []
         if analyzed > 0 and errors:
             steps["analyze"] = "partial"
-            steps["insights"] = "done"
+            steps["insights"] = insights_status_for_analyze("partial", analyzed)
         elif analyzed > 0:
             steps["analyze"] = "done"
-            steps["insights"] = "done"
+            steps["insights"] = insights_status_for_analyze("done", analyzed)
         elif errors:
             steps["analyze"] = "failed"
-            steps["insights"] = "failed"
+            steps["insights"] = insights_status_for_analyze("failed", analyzed)
         else:
             diag = get_database_diagnostics(db)
-            if int(diag.get("analyzed_reviews") or 0) > 0:
+            stored_analyzed = int(diag.get("analyzed_reviews") or 0)
+            if stored_analyzed > 0:
                 steps["analyze"] = "done"
-                steps["insights"] = "done"
+                steps["insights"] = insights_status_for_analyze("done", stored_analyzed)
             else:
                 steps["analyze"] = "insufficient"
-                steps["insights"] = "insufficient"
+                steps["insights"] = insights_status_for_analyze("insufficient", stored_analyzed)
         return steps
     finally:
         db.close()
 
 
 def _pipeline_status_panel() -> None:
-    steps = st.session_state.get("pipeline_steps") or _pipeline_from_last_run()
+    failed_reason = None
+    pipeline_result = st.session_state.get("pipeline_result") or {}
+    steps = (
+        st.session_state.get("pipeline_steps")
+        or pipeline_result.get("steps")
+        or _pipeline_from_last_run()
+    )
     if not steps:
         return
+    failed_reason = derive_failed_reason(
+        steps=steps,
+        last_analysis=st.session_state.get("last_analysis"),
+        last_collection=st.session_state.get("last_collection"),
+        step4_error=st.session_state.get("step4_error"),
+        pipeline_result=pipeline_result,
+    )
     st.markdown('<div class="section-h">PIPELINE STATUS</div>', unsafe_allow_html=True)
     for key, label in (
         ("play", "Google Play"),
@@ -1623,13 +1648,10 @@ def _pipeline_status_panel() -> None:
     ):
         mark = _pipeline_mark(steps.get(key, "pending"))
         st.markdown(f'<div class="pipeline-row">{label} {mark}</div>', unsafe_allow_html=True)
-    if steps.get("analyze") in {"failed", "partial"}:
-        err = (st.session_state.get("step4_error") or {}).get("error")
-        if err:
-            st.error(err)
-    if failed_reason and (steps.get("play") == "failed" or steps.get("apple") == "failed"):
-        if isinstance(failed_reason, list) and failed_reason:
-            st.error("; ".join(str(x) for x in failed_reason[:3]))
+    if failed_reason and steps.get("analyze") in {"failed", "partial"}:
+        st.error(failed_reason)
+    elif failed_reason and (steps.get("play") == "failed" or steps.get("apple") == "failed"):
+        st.error(failed_reason)
 
 
 def _run_full_discovery(ai_ok: bool) -> None:
@@ -1700,14 +1722,15 @@ def _run_full_discovery(ai_ok: bool) -> None:
                     result.last_error = _openrouter_error(exc)
                     st.error(result.last_error)
             analyzed_now = int(get_database_diagnostics(db).get("analyzed_reviews") or 0)
-            if steps["analyze"] == "failed" and analyzed_now == 0:
-                steps["insights"] = "failed"
-            elif analyzed_now == 0:
-                steps["insights"] = "insufficient"
-            else:
-                steps["insights"] = "done"
+            steps["insights"] = insights_status_for_analyze(steps["analyze"], analyzed_now)
             steps["dashboard"] = "done"
             st.session_state["pipeline_steps"] = steps
+            st.session_state["pipeline_result"] = {
+                "steps": dict(steps),
+                "failed_reason": result.last_error or None,
+                "analyzed": result.analyzed,
+                "failed": result.failed,
+            }
             _load_bundle.clear()
             st.session_state["last_analysis"] = {
                 "status": "Connected" if result.analyzed else "Failed",
@@ -1750,16 +1773,21 @@ def _run_collect(sources: list[str], analyze: bool, mode: str = "latest") -> Non
         if analyze:
             if stats.analysis_error and stats.analyzed == 0:
                 steps["analyze"] = "failed"
-                steps["insights"] = "failed"
-            elif stats.analyzed > 0 and stats.analysis_error:
+            elif stats.analyzed > 0 and (stats.analysis_error or stats.analysis_failed):
                 steps["analyze"] = "partial"
-                steps["insights"] = "done"
             elif stats.analyzed > 0:
                 steps["analyze"] = "done"
-                steps["insights"] = "done"
             else:
                 steps["analyze"] = "no_new"
+            analyzed_now = int(get_database_diagnostics(db).get("analyzed_reviews") or 0)
+            steps["insights"] = insights_status_for_analyze(steps["analyze"], analyzed_now)
         st.session_state["pipeline_steps"] = steps
+        st.session_state["pipeline_result"] = {
+            "steps": dict(steps),
+            "failed_reason": stats.analysis_error or ("; ".join(stats.errors[:3]) if stats.errors else None),
+            "analyzed": stats.analyzed,
+            "failed": stats.analysis_failed,
+        }
         _load_bundle.clear()
         if analyze and stats.analysis_error and stats.analyzed == 0:
             st.error("Reviews collected successfully, but OpenRouter analysis failed.")
@@ -1794,6 +1822,26 @@ def _run_analyze(*, only_failed: bool = False) -> None:
         )
         if result.analyzed == 0 and result.failed:
             st.error(_openrouter_error(result.last_error or f"OpenRouter analysis failed for {result.failed} reviews."))
+        analyze_step = "pending"
+        if result.analyzed > 0 and (result.failed or result.last_error):
+            analyze_step = "partial"
+        elif result.analyzed > 0:
+            analyze_step = "done"
+        elif result.failed or result.last_error:
+            analyze_step = "failed"
+        else:
+            analyze_step = "insufficient"
+        analyzed_now = int(get_database_diagnostics(db).get("analyzed_reviews") or 0)
+        steps = st.session_state.get("pipeline_steps") or {}
+        steps["analyze"] = analyze_step
+        steps["insights"] = insights_status_for_analyze(analyze_step, analyzed_now)
+        st.session_state["pipeline_steps"] = steps
+        st.session_state["pipeline_result"] = {
+            "steps": dict(steps),
+            "failed_reason": result.last_error or None,
+            "analyzed": result.analyzed,
+            "failed": result.failed,
+        }
         st.session_state["last_analysis"] = {
             "status": "Connected" if result.analyzed else "Configured",
             "message": result.last_error or f"Analyzed {result.analyzed}, failed {result.failed}.",

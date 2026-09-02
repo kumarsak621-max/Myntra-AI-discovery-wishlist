@@ -16,7 +16,8 @@ Look specifically for evidence related to:
 - size/fit, availability, styling uncertainty, occasion
 - social validation, external research, purchase confidence
 
-Return ONLY valid JSON. No markdown, no prose, no explanations outside JSON.
+Return ONLY valid JSON. The first non-whitespace character MUST be `{`.
+No markdown, no prose, no code fences, no explanations outside JSON.
 Do not invent quotes, review IDs, or facts.
 Analyze only the supplied review text.
 If there is no evidence for a field, return an empty list [] rather than None, empty string, or a placeholder.
@@ -61,7 +62,7 @@ def analysis_user_prompt(
     text: str,
     region: str,
 ) -> str:
-    return f"""Return ONLY valid JSON matching this schema. No markdown. No prose.
+    return f"""Return ONLY valid JSON matching this schema. The first character must be {{. No markdown. No prose.
 
 SOURCE: {source}
 APP: {app_name}
@@ -102,7 +103,7 @@ def analysis_batch_user_prompt(items: list[dict]) -> str:
             )
         )
     joined = "\n\n-----\n\n".join(blocks)
-    return f"""Return ONLY valid JSON. No markdown. No prose. No explanations outside JSON.
+    return f"""Return ONLY valid JSON. The first character must be {{. No markdown. No prose. No explanations outside JSON.
 
 {{
   "results": [

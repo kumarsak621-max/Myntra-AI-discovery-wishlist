@@ -149,11 +149,28 @@ def test_malformed_batch_json_marks_only_that_batch_failed(db):
     db.commit()
 
     assert a.analysis.status == "failed"
-    assert b.analysis.status == "failed"
     assert "Malformed AI JSON" in (a.analysis.parse_error or "")
+    assert b.analysis.status == "analyzed"
     assert c.analysis.status == "analyzed"
+    assert result.analyzed == 2
+    assert result.failed == 1
+
+
+def test_malformed_json_retry_recovers_valid_payload(db):
+    row = _insert(db, "repair-1", "Wishlisted this dress but the size chart is missing.")
+
+    def complete(*, system, user):
+        if "not valid json" in user.lower():
+            ids = re.findall(r"REVIEW ID: (\S+)", user)
+            return json.dumps({"results": [_ok_item(i) for i in ids]})
+        return "I cannot output JSON in this turn."
+
+    provider = FakeProvider(complete, _settings(ai_request_batch_size=1))
+    result = analyze_new_reviews(db, provider=provider, limit=1)
+    db.commit()
     assert result.analyzed == 1
-    assert result.failed == 2
+    assert result.failed == 0
+    assert row.analysis.status == "analyzed"
 
 
 def test_analyzed_reviews_are_skipped(db):

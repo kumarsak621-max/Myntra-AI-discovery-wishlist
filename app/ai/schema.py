@@ -19,41 +19,140 @@ from app.schemas import (
 from app.pipeline.labels import is_placeholder_label, stored_category_text
 
 FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+OPEN_FENCE_RE = re.compile(r"^```(?:json)?\s*", re.IGNORECASE)
+TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
+
+
+def _strip_fences(raw: str) -> str:
+    text = (raw or "").strip()
+    fenced = FENCE_RE.search(text)
+    if fenced:
+        return fenced.group(1).strip()
+    if text.lower().startswith("```"):
+        text = OPEN_FENCE_RE.sub("", text, count=1)
+        if text.endswith("```"):
+            text = text[: -3].strip()
+    return text.strip()
+
+
+def _jsonish_repairs(text: str) -> list[str]:
+    """Progressive repairs for common model JSON mistakes. Original first."""
+    variants = [text]
+    smart = (
+        text.replace("\ufeff", "")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+        .replace("“", '"')
+        .replace("”", '"')
+    )
+    if smart != text:
+        variants.append(smart)
+    no_commas = TRAILING_COMMA_RE.sub(r"\1", variants[-1])
+    if no_commas not in variants:
+        variants.append(no_commas)
+    return variants
+
+
+def _close_truncated_json(text: str) -> str | None:
+    """Close unbalanced braces/brackets when the model hit max_tokens."""
+    in_string = False
+    escape = False
+    stack: list[str] = []
+    saw_key = False
+    for char in text:
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            stack.append("}")
+        elif char == "[":
+            stack.append("]")
+        elif char in {"}", "]"}:
+            if stack and stack[-1] == char:
+                stack.pop()
+        elif char == ":":
+            saw_key = True
+    if in_string or not stack or not saw_key:
+        return None
+    if '"results"' not in text and '"id"' not in text and '"problem"' not in text and '"relevance"' not in text:
+        return None
+    return text + "".join(reversed(stack))
+
+
+def _candidate_snippets(raw: str) -> list[str]:
+    snippets: list[str] = []
+    start_obj, end_obj = raw.find("{"), raw.rfind("}")
+    start_arr, end_arr = raw.find("["), raw.rfind("]")
+    if start_obj != -1 and end_obj > start_obj:
+        snippets.append(raw[start_obj : end_obj + 1])
+    if start_arr != -1 and end_arr > start_arr:
+        snippets.append(raw[start_arr : end_arr + 1])
+    if start_obj != -1 and (end_obj == -1 or end_obj < start_obj):
+        closed = _close_truncated_json(raw[start_obj:])
+        if closed:
+            snippets.append(closed)
+    # De-dupe while preserving order
+    seen: set[str] = set()
+    unique: list[str] = []
+    for item in snippets:
+        if item not in seen:
+            seen.add(item)
+            unique.append(item)
+    return unique
+
+
+def _load_json(text: str) -> Any:
+    return json.loads(text)
 
 
 def extract_json_value(text: str) -> Any:
     if not text or not str(text).strip():
         raise ValueError("Empty AI response")
-    raw = str(text).strip()
-    fenced = FENCE_RE.search(raw)
-    if fenced:
-        raw = fenced.group(1).strip()
-    try:
-        payload = json.loads(raw)
-        if isinstance(payload, (dict, list)):
-            return payload
-        raise ValueError("AI JSON root is not an object or array")
-    except json.JSONDecodeError:
-        snippets: list[tuple[int, str]] = []
-        start_obj, end_obj = raw.find("{"), raw.rfind("}")
-        start_arr, end_arr = raw.find("["), raw.rfind("]")
-        if start_obj != -1 and end_obj > start_obj:
-            snippets.append((start_obj, raw[start_obj : end_obj + 1]))
-        if start_arr != -1 and end_arr > start_arr:
-            snippets.append((start_arr, raw[start_arr : end_arr + 1]))
-        if not snippets:
-            raise ValueError("No JSON object found in AI response") from None
-        snippets.sort()
-        last_err: Exception | None = None
-        for _, snippet in snippets:
+    raw = _strip_fences(str(text))
+    last_err: Exception | None = None
+    candidates = [raw] + _candidate_snippets(raw)
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        for variant in _jsonish_repairs(candidate):
             try:
-                payload = json.loads(snippet)
+                payload = _load_json(variant)
             except json.JSONDecodeError as exc:
                 last_err = exc
-                continue
+                closed = _close_truncated_json(variant)
+                if closed and closed != variant:
+                    try:
+                        payload = _load_json(closed)
+                    except json.JSONDecodeError as repair_exc:
+                        last_err = repair_exc
+                        continue
+                else:
+                    continue
             if isinstance(payload, (dict, list)):
                 return payload
+            if isinstance(payload, str) and payload.strip()[:1] in "{[":
+                try:
+                    nested = extract_json_value(payload)
+                except ValueError as exc:
+                    last_err = exc
+                    continue
+                return nested
+            raise ValueError("AI JSON root is not an object or array")
+    if last_err is not None:
         raise ValueError("No JSON object found in AI response") from last_err
+    raise ValueError("No JSON object found in AI response") from None
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
