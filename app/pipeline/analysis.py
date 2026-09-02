@@ -112,8 +112,18 @@ def persist_analysis(
         row.wishlist_signal = parsed.wishlist_signal
         row.purchase_signal = parsed.purchase_signal
         row.purchase_hesitation = parsed.purchase_hesitation
-        row.intent_json = json.dumps([stored_category_text(x) for x in parsed.intent if stored_category_text(x)])
-        row.barriers_json = json.dumps([stored_category_text(x) for x in parsed.barriers if stored_category_text(x)])
+        intent_vals = [stored_category_text(x) for x in parsed.intent if stored_category_text(x)]
+        for extra in parsed.wishlist_behavior:
+            text = stored_category_text(extra)
+            if text and text not in intent_vals:
+                intent_vals.append(text)
+        row.intent_json = json.dumps(intent_vals)
+        barriers = [stored_category_text(x) for x in parsed.barriers if stored_category_text(x)]
+        for extra in parsed.purchase_barriers:
+            text = stored_category_text(extra)
+            if text and text not in barriers:
+                barriers.append(text)
+        row.barriers_json = json.dumps(barriers)
         row.uncertainties_json = json.dumps(
             [stored_category_text(x) for x in parsed.uncertainties if stored_category_text(x)]
         )
@@ -388,6 +398,12 @@ def analyze_new_reviews(
     max_chars = int(getattr(settings, "ai_max_review_chars", 4000) or 4000)
     if batch_size >= 5:
         max_chars = min(max_chars, 1500)
+    from config.settings import clamp_max_tokens
+
+    max_tokens = min(clamp_max_tokens(getattr(settings, "ai_max_tokens", 2000)), 2000)
+    logger.info("OpenRouter model: %s", provider.model)
+    logger.info("OpenRouter max_tokens: %s", max_tokens)
+    logger.info("Batch size: %s", batch_size)
     chunks = _chunks(pending, batch_size)
     batch_total = len(chunks)
     processed = 0

@@ -39,6 +39,13 @@ HTTP_HEADERS = {
     "Accept": "application/json, application/xml, text/xml, */*",
 }
 
+APPLE_FETCH_FAILED = "APPLE_FETCH_FAILED"
+APPLE_FETCH_SUCCESS_NO_NEW_REVIEWS = "APPLE_FETCH_SUCCESS_NO_NEW_REVIEWS"
+APPLE_NEW_REVIEWS_FOUND = "APPLE_NEW_REVIEWS_FOUND"
+PLAY_FETCH_FAILED = "PLAY_FETCH_FAILED"
+PLAY_FETCH_SUCCESS_NO_NEW_REVIEWS = "PLAY_FETCH_SUCCESS_NO_NEW_REVIEWS"
+PLAY_NEW_REVIEWS_FOUND = "PLAY_NEW_REVIEWS_FOUND"
+
 
 def _parse_dt(value: Any) -> datetime | None:
     if not value:
@@ -90,6 +97,8 @@ class AppStoreCollector(BaseCollector):
         self._client = client
         self.region_used: str = self.settings.apple_primary_region
         self.fallback_used: bool = False
+        self.fetch_status: str = APPLE_FETCH_FAILED
+        self._last_fetch_ok: bool = False
 
     def _http(self) -> httpx.Client:
         if self._client is not None:
@@ -154,17 +163,31 @@ class AppStoreCollector(BaseCollector):
         try:
             meta = self.lookup_metadata(region)
         except Exception as exc:
-            logger.exception("App Store lookup failed")
-            self.errors.append(str(exc))
-            validation = validate_app_identity(
-                platform=self.platform,
-                app_id=app_id,
-                region=region,
-                expected_app=self.settings.expected_apple_app_name,
-                metadata={"error": str(exc)},
-            )
-            validation.validation_status = "ERROR"
-            validation.warning = f"App Store lookup failed for {app_id} ({region}): {exc}"
+            logger.warning("App Store lookup failed for %s (%s): %s", app_id, region, exc)
+            if is_official_myntra_app_id(app_id, self.platform):
+                validation = validate_app_identity(
+                    platform=self.platform,
+                    app_id=app_id,
+                    detected_app_name=self.settings.expected_apple_app_name,
+                    detected_developer="Myntra Designs Private Limited",
+                    region=region,
+                    expected_app=self.settings.expected_apple_app_name,
+                    metadata={"error": str(exc), "lookup_failed": True},
+                )
+                validation.warning = (
+                    f"App Store lookup failed for {app_id} ({region}): {exc}. "
+                    "Continuing with the official Myntra App Store ID."
+                )
+            else:
+                validation = validate_app_identity(
+                    platform=self.platform,
+                    app_id=app_id,
+                    region=region,
+                    expected_app=self.settings.expected_apple_app_name,
+                    metadata={"error": str(exc)},
+                )
+                validation.validation_status = "ERROR"
+                validation.warning = f"App Store lookup failed for {app_id} ({region}): {exc}"
             self.last_validation = validation
             return validation
 
@@ -289,12 +312,14 @@ class AppStoreCollector(BaseCollector):
         seen: set[str] = set()
         cutoff = ensure_aware(stop_when_older_than)
         app_id = self.settings.apple_app_id
+        self._last_fetch_ok = False
         for page in range(1, MAX_RSS_PAGES + 1):
             if len(gathered) >= limit:
                 break
             url = RSS_JSON.format(region=region, page=page, app_id=app_id)
             page_rows: list[dict[str, Any]] = []
             json_error: Exception | None = None
+            page_http_ok = False
             try:
                 payload = with_retry(
                     lambda u=url: self._get_json(u),
@@ -302,6 +327,7 @@ class AppStoreCollector(BaseCollector):
                     label=f"app-store rss json {region} p{page}",
                 )
                 page_rows = self._parse_json_feed(payload, region)
+                page_http_ok = True
             except Exception as exc:
                 json_error = exc
                 logger.warning("JSON RSS failed %s page %s: %s — trying XML", region, page, exc)
@@ -313,10 +339,12 @@ class AppStoreCollector(BaseCollector):
                         label=f"app-store rss xml {region} p{page}",
                     )
                     page_rows = self._parse_xml_feed(xml_text, region)
+                    page_http_ok = True
                 except Exception as xml_exc:
                     detail = f"{region} page {page}: {xml_exc}"
                     if json_error:
                         detail = f"{region} page {page}: json={json_error}; xml={xml_exc}"
+                    logger.error("Apple App Store fetch failed: %s", detail)
                     self.errors.append(detail)
                     if progress:
                         progress(
@@ -330,6 +358,8 @@ class AppStoreCollector(BaseCollector):
                         )
                     break
 
+            if page_http_ok:
+                self._last_fetch_ok = True
             if not page_rows:
                 break
             new_on_page = 0
@@ -384,31 +414,16 @@ class AppStoreCollector(BaseCollector):
             limit = self.settings.apple_max_reviews
         primary = self.settings.apple_primary_region
         fallback = self.settings.apple_fallback_region
+        self.fetch_status = APPLE_FETCH_FAILED
+        self.fallback_used = False
+        self.region_used = primary
 
-        primary_validation = self.validate_source(progress=progress, region=primary)
         app_id = self.settings.apple_app_id
         if is_banned_app_id(app_id) or not is_official_myntra_app_id(app_id, self.platform):
-            msg = primary_validation.warning or (
-                f"Refusing Myntra collection for non-official App Store ID {app_id}."
-            )
+            msg = f"Refusing Myntra collection for non-official App Store ID {app_id}."
             logger.error(msg)
             self.errors.append(msg)
-            self.last_validation = primary_validation
-            if progress:
-                progress(
-                    {
-                        "stage": "apple_app_store",
-                        "status": "error",
-                        "message": msg,
-                        "validation_result": "FAIL",
-                    }
-                )
-            return []
-        if not primary_validation.is_valid_for_myntra:
-            msg = primary_validation.warning or "Apple App Store identity validation FAIL."
-            logger.error(msg)
-            self.errors.append(msg)
-            self.last_validation = primary_validation
+            self.last_validation = self.validate_source(progress=progress, region=primary)
             if progress:
                 progress(
                     {
@@ -420,48 +435,113 @@ class AppStoreCollector(BaseCollector):
                 )
             return []
 
-        raw_primary = self._fetch_region_pages(
-            primary, limit, progress, stop_when_older_than=stop_when_older_than
-        )
-        written_primary = [
-            r for r in raw_primary if _has_written_body(str(r.get("title") or ""), str(r.get("content") or ""))
-        ]
+        def _written(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return [
+                row
+                for row in rows
+                if _has_written_body(str(row.get("title") or ""), str(row.get("content") or ""))
+            ]
+
+        def _try_region(region: str) -> tuple[SourceValidation, list[dict[str, Any]], bool]:
+            prior_errors = list(self.errors)
+            validation = self.validate_source(progress=progress, region=region)
+            raw = self._fetch_region_pages(
+                region, limit, progress, stop_when_older_than=stop_when_older_than
+            )
+            fetch_ok = bool(self._last_fetch_ok)
+            if fetch_ok:
+                self.errors = [item for item in self.errors if item in prior_errors]
+            return validation, raw, fetch_ok
+
+        primary_validation, raw_primary, primary_ok = _try_region(primary)
+        written_primary = _written(raw_primary)
 
         raw_rows = raw_primary
         validation = primary_validation
         self.region_used = primary
-        self.fallback_used = False
+        region_ok = primary_ok
 
-        if not written_primary:
+        need_fallback = (not primary_validation.is_valid_for_myntra) or (not written_primary) or (not primary_ok)
+        if need_fallback and fallback and fallback != primary:
             if progress:
                 progress(
                     {
                         "stage": "apple_app_store",
                         "status": "fallback",
                         "message": (
-                            f"No written reviews in region '{primary}'. "
-                            f"Falling back to '{fallback}'. US reviews will be stored as region={fallback}."
+                            f"India region '{primary}' had no usable reviews "
+                            f"(identity_ok={primary_validation.is_valid_for_myntra}, "
+                            f"written={len(written_primary)}, fetch_ok={primary_ok}). "
+                            f"Falling back to '{fallback}'."
                         ),
                     }
                 )
-            fallback_validation = self.validate_source(progress=progress, region=fallback)
-            raw_fallback = self._fetch_region_pages(
-                fallback, limit, progress, stop_when_older_than=stop_when_older_than
+            logger.warning(
+                "Apple India fetch insufficient (identity_ok=%s written=%s fetch_ok=%s); trying %s",
+                primary_validation.is_valid_for_myntra,
+                len(written_primary),
+                primary_ok,
+                fallback,
             )
-            raw_rows = raw_fallback
-            validation = fallback_validation
-            self.region_used = fallback
-            self.fallback_used = True
+            fallback_validation, raw_fallback, fallback_ok = _try_region(fallback)
+            written_fallback = _written(raw_fallback)
+            if written_fallback or (fallback_ok and fallback_validation.is_valid_for_myntra):
+                raw_rows = raw_fallback
+                validation = fallback_validation
+                self.region_used = fallback
+                self.fallback_used = True
+                region_ok = fallback_ok
+            elif not written_primary and written_fallback:
+                raw_rows = raw_fallback
+                validation = fallback_validation
+                self.region_used = fallback
+                self.fallback_used = True
+                region_ok = fallback_ok
 
-        normalized = [self.normalize(row, validation) for row in raw_rows]
-        if not normalized and validation.is_valid_for_myntra:
-            msg = (
-                f"Apple App Store returned 0 written reviews for {app_id} "
-                f"(region={self.region_used}, fallback_used={self.fallback_used})."
+        self.last_validation = validation
+        if not validation.is_valid_for_myntra and not _written(raw_rows):
+            msg = validation.warning or (
+                f"Apple App Store identity validation FAIL for {app_id} "
+                f"(region={self.region_used})."
             )
             logger.error(msg)
             if msg not in self.errors:
                 self.errors.append(msg)
+            self.fetch_status = APPLE_FETCH_FAILED
+            if progress:
+                progress(
+                    {
+                        "stage": "apple_app_store",
+                        "status": "error",
+                        "message": msg,
+                        "validation_result": "FAIL",
+                    }
+                )
+            return []
+
+        normalized = [self.normalize(row, validation) for row in raw_rows]
+        if region_ok:
+            self.fetch_status = (
+                APPLE_NEW_REVIEWS_FOUND if normalized else APPLE_FETCH_SUCCESS_NO_NEW_REVIEWS
+            )
+            if not normalized:
+                logger.info(
+                    "Apple App Store checked %s successfully but returned 0 written reviews "
+                    "(fallback_used=%s). Not treating this as a fetch failure.",
+                    self.region_used,
+                    self.fallback_used,
+                )
+        else:
+            self.fetch_status = APPLE_FETCH_FAILED
+            msg = (
+                f"Apple App Store fetch failed for {app_id} "
+                f"(region={self.region_used}, fallback_used={self.fallback_used})."
+            )
+            logger.error("%s errors=%s", msg, list(self.errors))
+            if msg not in self.errors:
+                self.errors.append(msg)
+        if self.fetch_status != APPLE_FETCH_FAILED:
+            self.errors = []
         if progress:
             progress(
                 {
@@ -470,6 +550,7 @@ class AppStoreCollector(BaseCollector):
                     "fetched": len(normalized),
                     "region_used": self.region_used,
                     "fallback_used": self.fallback_used,
+                    "fetch_status": self.fetch_status,
                     "errors": list(self.errors),
                     "validation": validation.model_dump(mode="json"),
                 }

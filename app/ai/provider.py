@@ -20,9 +20,18 @@ from config.settings import (
 logger = logging.getLogger(__name__)
 
 QUOTA_MESSAGE = "OpenRouter rate limit reached. Please try again later."
-CREDIT_402_MESSAGE = (
-    "OpenRouter token/credit limit reached. Reduce max_tokens or add credits."
-)
+CONNECTION_TEST_MAX_TOKENS = 100
+HARD_MAX_TOKENS = 2000
+
+
+def credit_limit_message(max_tokens: int) -> str:
+    return (
+        "OpenRouter credits/token limit reached. "
+        f"The request was limited to max_tokens={int(max_tokens)}."
+    )
+
+
+CREDIT_402_MESSAGE = credit_limit_message(HARD_MAX_TOKENS)
 MISSING_KEY_MESSAGE = (
     "OpenRouter API key is not configured. "
     "Add OPENROUTER_API_KEY to Streamlit Secrets or .env."
@@ -189,7 +198,7 @@ class OpenRouterAIService:
         raise last_error or AIError("OpenRouter request failed")
 
     def _post_chat(self, *, system: str, user: str, json_object: bool) -> str:
-        max_tokens = self._max_output_tokens()
+        max_tokens = min(self._max_output_tokens(), HARD_MAX_TOKENS)
         payload: dict[str, Any] = {
             "model": self.model,
             "temperature": 0.2,
@@ -201,6 +210,11 @@ class OpenRouterAIService:
         }
         if json_object:
             payload["response_format"] = {"type": "json_object"}
+        logger.info(
+            "OpenRouter model: %s",
+            self.model,
+        )
+        logger.info("OpenRouter max_tokens: %s", max_tokens)
         try:
             with httpx.Client(timeout=self._timeout()) as client:
                 response = client.post(self._endpoint, headers=self._headers(), json=payload)
@@ -208,7 +222,7 @@ class OpenRouterAIService:
             raise AIError("The OpenRouter request timed out. Try fewer reviews, then retry.", retryable=True) from exc
         except httpx.ConnectError as exc:
             raise AIError("Network error contacting OpenRouter.", retryable=True) from exc
-        text, usage = _content_from_response(response)
+        text, usage = _content_from_response(response, max_tokens=max_tokens)
         self.last_usage = usage
         return text
 
@@ -252,7 +266,11 @@ def _openrouter_error_text(response: httpx.Response) -> str:
     return body[:300]
 
 
-def _content_from_response(response: httpx.Response) -> tuple[str, dict[str, int]]:
+def _content_from_response(
+    response: httpx.Response,
+    *,
+    max_tokens: int | None = None,
+) -> tuple[str, dict[str, int]]:
     status = response.status_code
     snippet = _openrouter_error_text(response)
     if status == 401:
@@ -264,15 +282,18 @@ def _content_from_response(response: httpx.Response) -> tuple[str, dict[str, int
             http_status=403,
         )
     if status == 404:
+        detail = snippet or (
+            "Set OPENROUTER_MODEL / AI_MODEL to a model your OpenRouter account can use. "
+            "Preferred: google/gemini-2.5-flash-lite. Fallback: google/gemini-2.5-flash."
+        )
         raise AIError(
-            f"Configured model/endpoint unavailable (HTTP 404). "
-            f"{snippet or 'Set OPENROUTER_MODEL to a model your OpenRouter account can use.'}",
+            f"Configured model unavailable (HTTP 404). {detail}",
             http_status=404,
         )
     if status == 429:
         raise AIError(QUOTA_MESSAGE, retryable=True, http_status=429)
     if status == 402:
-        raise AIError(CREDIT_402_MESSAGE, http_status=402)
+        raise AIError(credit_limit_message(max_tokens or HARD_MAX_TOKENS), http_status=402)
     if status in {500, 502, 503, 504}:
         raise AIError(
             f"OpenRouter/provider server error (HTTP {status}). Retrying.",
@@ -354,6 +375,7 @@ def test_openrouter_connection(settings: Settings | None = None) -> dict[str, An
         "http_status": None,
         "error": None,
         "endpoint": OPENROUTER_CHAT_URL,
+        "max_tokens": CONNECTION_TEST_MAX_TOKENS,
     }
     if not configured:
         result["error"] = MISSING_KEY_MESSAGE
@@ -365,38 +387,39 @@ def test_openrouter_connection(settings: Settings | None = None) -> dict[str, An
         return result
 
     service = OpenRouterAIService(settings)
-    attempts = min(3, max(1, int(settings.ai_retry_attempts or 3)))
-    last_error = "OpenRouter connection test failed."
-    for attempt in range(1, attempts + 1):
-        try:
-            payload = {
-                "model": model,
-                "temperature": 0,
-                "max_tokens": 16,
-                "messages": [
-                    {"role": "system", "content": "You are a test assistant."},
-                    {"role": "user", "content": "Reply with the word OK."},
-                ],
-            }
-            with httpx.Client(timeout=service._timeout()) as client:
-                response = client.post(service._endpoint, headers=service._headers(), json=payload)
-            result["http_status"] = response.status_code
-            text, _usage = _content_from_response(response)
-            if not text:
-                result["error"] = "OpenRouter returned empty content."
-                return result
-            result["ok"] = True
-            result["status"] = "SUCCESS"
-            result["error"] = None
+    try:
+        payload = {
+            "model": model,
+            "temperature": 0,
+            "max_tokens": CONNECTION_TEST_MAX_TOKENS,
+            "messages": [
+                {"role": "system", "content": "You are a test assistant."},
+                {"role": "user", "content": "Reply with the word OK."},
+            ],
+        }
+        logger.info("OpenRouter connection test model: %s", model)
+        logger.info("OpenRouter connection test max_tokens: %s", CONNECTION_TEST_MAX_TOKENS)
+        with httpx.Client(timeout=service._timeout()) as client:
+            response = client.post(service._endpoint, headers=service._headers(), json=payload)
+        result["http_status"] = response.status_code
+        text, _usage = _content_from_response(response, max_tokens=CONNECTION_TEST_MAX_TOKENS)
+        if not text:
+            result["error"] = "OpenRouter returned empty content."
             return result
-        except Exception as exc:
-            mapped = _map_openrouter_exception(exc)
-            last_error = str(mapped)
-            result["http_status"] = mapped.http_status
-            if mapped.retryable and attempt < attempts:
-                time.sleep(_backoff_seconds(attempt, None))
-                continue
-            result["error"] = last_error
-            return result
-    result["error"] = last_error
-    return result
+        result["ok"] = True
+        result["status"] = "SUCCESS"
+        result["error"] = None
+        return result
+    except Exception as exc:
+        mapped = _map_openrouter_exception(exc)
+        result["http_status"] = mapped.http_status
+        if mapped.http_status == 402:
+            result["error"] = "insufficient OpenRouter credits"
+        elif mapped.http_status == 404:
+            result["error"] = (
+                f"Configured model unavailable. Set OPENROUTER_MODEL to "
+                f"{model} or google/gemini-2.5-flash-lite."
+            )
+        else:
+            result["error"] = str(mapped)
+        return result

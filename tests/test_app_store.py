@@ -212,3 +212,57 @@ def test_app_store_http_error_is_recorded():
     reviews = collector.collect(max_reviews=5)
     assert reviews == []
     assert collector.errors
+    assert collector.fetch_status == "APPLE_FETCH_FAILED"
+
+
+def test_india_identity_fail_falls_back_to_us():
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "lookup" in url and "country=in" in url:
+            return httpx.Response(200, json=_lookup("Unknown App"))
+        if "lookup" in url and "country=us" in url:
+            return httpx.Response(200, json=_lookup())
+        if "/in/rss/" in url:
+            return httpx.Response(200, json=_feed([]))
+        if "/us/rss/" in url:
+            return httpx.Response(
+                200,
+                json=_feed(
+                    [
+                        {
+                            "id": "us-fallback",
+                            "title": "Wishlist",
+                            "content": "Saved for later because the price is high.",
+                            "rating": 3,
+                        }
+                    ]
+                ),
+            )
+        return httpx.Response(404, json={"error": url})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    settings = Settings(collection_rate_limit_seconds=0, collection_retry_attempts=1)
+    collector = AppStoreCollector(settings=settings, client=client)
+    reviews = collector.collect(max_reviews=5)
+    assert collector.fallback_used is True
+    assert collector.region_used == "us"
+    assert len(reviews) == 1
+    assert reviews[0].region == "us"
+    assert collector.fetch_status == "APPLE_NEW_REVIEWS_FOUND"
+    assert collector.errors == []
+
+
+def test_successful_empty_feed_is_not_a_fetch_failure():
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "lookup" in url:
+            return httpx.Response(200, json=_lookup())
+        return httpx.Response(200, json=_feed([]))
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    settings = Settings(collection_rate_limit_seconds=0, collection_retry_attempts=1)
+    collector = AppStoreCollector(settings=settings, client=client)
+    reviews = collector.collect(max_reviews=5)
+    assert reviews == []
+    assert collector.errors == []
+    assert collector.fetch_status == "APPLE_FETCH_SUCCESS_NO_NEW_REVIEWS"

@@ -10,7 +10,15 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.collectors.app_store import AppStoreCollector
+from app.collectors.app_store import (
+    APPLE_FETCH_FAILED,
+    APPLE_FETCH_SUCCESS_NO_NEW_REVIEWS,
+    APPLE_NEW_REVIEWS_FOUND,
+    PLAY_FETCH_FAILED,
+    PLAY_FETCH_SUCCESS_NO_NEW_REVIEWS,
+    PLAY_NEW_REVIEWS_FOUND,
+    AppStoreCollector,
+)
 from app.collectors.google_play import GooglePlayCollector
 from app.config import Settings, get_settings
 from app.models import CollectionRun, utcnow
@@ -79,20 +87,23 @@ class CollectionEngine:
                 reviews = gp.collect(progress=progress, **_collect_kwargs("google_play"))
                 validation = gp.last_validation or gp.validate_source()
                 stats = gp.save_raw(self.db, reviews, validation, collection_run_id=run.id)
-                if validation.is_valid_for_myntra and stats.fetched == 0 and not gp.errors:
-                    msg = (
-                        "Google Play collection failed: identity validated as Myntra, "
-                        "but 0 public reviews were returned. "
-                        "The Play Store may be blocking this host."
-                    )
-                    gp.errors.append(msg)
-                    logger.error(msg)
+                if gp.errors and stats.fetched == 0:
+                    play_status = PLAY_FETCH_FAILED
+                elif stats.new > 0:
+                    play_status = PLAY_NEW_REVIEWS_FOUND
+                else:
+                    play_status = PLAY_FETCH_SUCCESS_NO_NEW_REVIEWS
+                    if validation.is_valid_for_myntra and stats.fetched == 0:
+                        logger.info(
+                            "Google Play source checked successfully but returned 0 new reviews."
+                        )
                 combined.fetched += stats.fetched
                 combined.valid += stats.valid
                 combined.rejected += stats.rejected
                 combined.duplicates += stats.duplicates
                 combined.new += stats.new
-                combined.errors.extend(gp.errors)
+                if play_status == PLAY_FETCH_FAILED:
+                    combined.errors.extend(gp.errors)
                 validations.extend(stats.source_validations)
                 combined.by_source["google_play"] = {
                     "fetched": stats.fetched,
@@ -107,6 +118,7 @@ class CollectionEngine:
                     "detected_app": validation.detected_app_name,
                     "is_valid_for_myntra": validation.is_valid_for_myntra,
                     "warning": validation.warning,
+                    "fetch_status": play_status,
                     "in_window": len(filter_reviews_by_date(reviews, cutoff)) if cutoff else stats.fetched,
                     "latest_review_at": (
                         max((r.review_date for r in reviews if r.review_date), default=None)
@@ -133,20 +145,27 @@ class CollectionEngine:
                 reviews = apple.collect(progress=progress, **_collect_kwargs("apple_app_store"))
                 validation = apple.last_validation or apple.validate_source(region=apple.region_used)
                 stats = apple.save_raw(self.db, reviews, validation, collection_run_id=run.id)
-                if validation.is_valid_for_myntra and stats.fetched == 0 and not apple.errors:
-                    msg = (
-                        "Apple App Store collection failed: identity validated as Myntra, "
-                        f"but 0 written reviews were returned from {apple.region_used}"
-                        f"{' after India → US fallback' if apple.fallback_used else ''}."
+                if apple.fetch_status == APPLE_FETCH_FAILED:
+                    apple_status = APPLE_FETCH_FAILED
+                elif stats.new > 0:
+                    apple_status = APPLE_NEW_REVIEWS_FOUND
+                else:
+                    apple_status = APPLE_FETCH_SUCCESS_NO_NEW_REVIEWS
+                    logger.info(
+                        "Apple App Store checked successfully (%s) but stored 0 new reviews "
+                        "(fetched=%s duplicates=%s).",
+                        apple.region_used,
+                        stats.fetched,
+                        stats.duplicates,
                     )
-                    apple.errors.append(msg)
-                    logger.error(msg)
+                apple.fetch_status = apple_status
                 combined.fetched += stats.fetched
                 combined.valid += stats.valid
                 combined.rejected += stats.rejected
                 combined.duplicates += stats.duplicates
                 combined.new += stats.new
-                combined.errors.extend(apple.errors)
+                if apple_status == APPLE_FETCH_FAILED:
+                    combined.errors.extend(apple.errors)
                 validations.extend(stats.source_validations)
                 combined.by_source["apple_app_store"] = {
                     "fetched": stats.fetched,
@@ -163,6 +182,7 @@ class CollectionEngine:
                     "detected_app": validation.detected_app_name,
                     "is_valid_for_myntra": validation.is_valid_for_myntra,
                     "warning": validation.warning,
+                    "fetch_status": apple_status,
                     "in_window": len(filter_reviews_by_date(reviews, cutoff)) if cutoff else stats.fetched,
                     "latest_review_at": (
                         max((r.review_date for r in reviews if r.review_date), default=None)
@@ -181,6 +201,7 @@ class CollectionEngine:
                             "duplicates": stats.duplicates,
                             "region_used": apple.region_used,
                             "fallback_used": apple.fallback_used,
+                            "fetch_status": apple_status,
                         }
                     )
 
@@ -216,7 +237,7 @@ class CollectionEngine:
                     logger.exception(msg)
                     combined.errors.append(msg)
                     combined.analysis_error = msg
-            from app.database import get_database_diagnostics
+            from app.database import get_database_diagnostics, get_review_count
 
             combined.pending_remaining = int(get_database_diagnostics(self.db).get("pending_reviews") or 0)
 
@@ -224,8 +245,20 @@ class CollectionEngine:
             combined.duration_seconds = round(time.monotonic() - started, 2)
             run.status = "completed" if not combined.errors else "completed_with_errors"
             run.mode = mode
-            if cutoff:
-                run.notes = f"window_start={cutoff.isoformat()}"
+            gp_info = combined.by_source.get("google_play") or {}
+            apple_info = combined.by_source.get("apple_app_store") or {}
+            run.notes = json.dumps(
+                {
+                    "window_start": cutoff.isoformat() if cutoff else None,
+                    "google_play_new": gp_info.get("new", 0),
+                    "apple_new": apple_info.get("new", 0),
+                    "google_play_status": gp_info.get("fetch_status") or "",
+                    "apple_status": apple_info.get("fetch_status") or "",
+                    "stored": get_review_count(self.db, myntra_only=True),
+                    "analyzed": combined.analyzed,
+                    "errors": list(combined.errors)[:8],
+                }
+            )
             run.fetched = combined.fetched
             run.valid = combined.valid
             run.rejected = combined.rejected

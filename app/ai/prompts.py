@@ -4,15 +4,30 @@ Hypotheses listed here are examples only. The model must not assume they apply.
 Keep outputs short so OpenRouter stays within a small max_tokens budget.
 """
 
-SYSTEM_PROMPT = """You analyze public app reviews for wishlist-to-purchase research.
+SYSTEM_PROMPT = """You analyze public app reviews as proxy evidence for wishlist-to-purchase research.
 
-Return concise JSON only.
-Do not include explanations outside the JSON.
-Keep each field concise.
+The business objective is to increase the percentage of users who purchase at least one wishlist item within 30 days.
+Public reviews do NOT measure actual wishlist-to-purchase conversion. Treat them as proxy evidence only.
+Do not claim that a review proves in-app conversion.
+
+Look specifically for evidence related to:
+- saving, bookmarking, wishlist, saved items, intent to purchase later
+- hesitation, postponement, price concerns, comparison, reviews
+- size/fit, availability, styling uncertainty, occasion
+- social validation, external research, purchase confidence
+
+Return ONLY valid JSON. No markdown, no prose, no explanations outside JSON.
 Do not invent quotes, review IDs, or facts.
 Analyze only the supplied review text.
-Do not write essays, reasoning traces, or reports.
-If the review is unrelated to shopping or purchase hesitation, set evidence_type to "none" and leave the other fields empty.
+If there is no evidence for a field, return an empty list [] rather than None, empty string, or a placeholder.
+Never use "none", "None", "N/A", "unknown", or similar placeholders as labels.
+Do not infer wishlist behavior from a generic price compliment. Use the actual review text.
+Distinguish explicit hesitation from implicit hesitation when the schema asks.
+
+List fields must ALWAYS be JSON arrays of strings.
+If there is no evidence, return [].
+Never return an empty string for a list field.
+Never return null for a list field unless the schema explicitly allows it.
 """
 
 
@@ -21,7 +36,11 @@ ANALYSIS_ITEM_SCHEMA = """{
   "problem": "",
   "root_cause": "",
   "wishlist_signal": false,
-  "wishlist_behavior": "",
+  "wishlist_behavior": [],
+  "purchase_barriers": [],
+  "uncertainties": [],
+  "themes": [],
+  "segments": [],
   "purchase_barrier": "",
   "uncertainty": "",
   "theme": "",
@@ -42,7 +61,7 @@ def analysis_user_prompt(
     text: str,
     region: str,
 ) -> str:
-    return f"""Return concise JSON only. Do not include explanations outside the JSON. Keep each field concise.
+    return f"""Return ONLY valid JSON matching this schema. No markdown. No prose.
 
 SOURCE: {source}
 APP: {app_name}
@@ -56,7 +75,11 @@ TEXT:
 Schema:
 {ANALYSIS_ITEM_SCHEMA}
 
-Use short phrases. Empty string if the review has no evidence for a field. Do not invent. Do not assume wishlist unless the text supports it.
+Rules:
+- wishlist_behavior must ALWAYS be a JSON array of strings. If there is no evidence, return []. Never return an empty string.
+- purchase_barriers, uncertainties, themes, and segments must ALWAYS be JSON arrays of strings. Use [] when evidence is absent.
+- Do not invent. Do not assume wishlist unless the text supports it.
+- Public reviews are proxy evidence only, not conversion events.
 """
 
 
@@ -79,7 +102,7 @@ def analysis_batch_user_prompt(items: list[dict]) -> str:
             )
         )
     joined = "\n\n-----\n\n".join(blocks)
-    return f"""Return concise JSON only. Do not include explanations outside the JSON. Keep each field concise.
+    return f"""Return ONLY valid JSON. No markdown. No prose. No explanations outside JSON.
 
 {{
   "results": [
@@ -87,7 +110,14 @@ def analysis_batch_user_prompt(items: list[dict]) -> str:
   ]
 }}
 
-One results[] object per review. Use the supplied REVIEW ID. Short phrases only. Empty fields if unsupported.
+One results[] object per review. Use the supplied REVIEW ID.
+
+Rules:
+- wishlist_behavior must ALWAYS be a JSON array of strings. If there is no evidence, return []. Never return an empty string.
+- purchase_barriers, uncertainties, themes, and segments must ALWAYS be JSON arrays of strings. Use [] when evidence is absent.
+- Never return "" or null for a list field.
+- Short phrases only. Do not invent. Do not assume wishlist unless the text supports it.
+- Public reviews are proxy evidence only, not conversion events.
 
 REVIEWS:
 

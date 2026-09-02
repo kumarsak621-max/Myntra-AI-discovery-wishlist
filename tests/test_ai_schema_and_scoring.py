@@ -146,6 +146,60 @@ def test_extended_discovery_arrays_map_without_breaking_existing_fields():
     assert any(item.signal == "reviews" for item in parsed.behavioral_signals)
 
 
+def test_wishlist_behavior_empty_string_normalizes_to_empty_list():
+    from app.ai.schema import try_validate_payload
+    from app.schemas import ReviewAnalysisSchema
+
+    parsed = ReviewAnalysisSchema.model_validate({"wishlist_behavior": "", "relevance": "none"})
+    assert parsed.wishlist_behavior == []
+
+    payload = {"wishlist_behavior": "", "relevance": "low", "problem": ""}
+    parsed, error = try_validate_payload(payload, "Nice app")
+    assert error == ""
+    assert parsed is not None
+    assert parsed.wishlist_behavior == []
+
+
+def test_wishlist_behavior_bare_string_wraps_to_list():
+    from app.ai.schema import try_validate_payload
+
+    parsed, error = try_validate_payload(
+        {"wishlist_behavior": "comparison", "relevance": "medium"},
+        "I compared prices before buying.",
+    )
+    assert error == ""
+    assert parsed is not None
+    assert parsed.wishlist_behavior == ["comparison"]
+    assert "comparison" in parsed.intent
+
+
+def test_wishlist_behavior_valid_list_is_unchanged():
+    from app.ai.schema import try_validate_payload
+
+    payload = {"wishlist_behavior": ["comparison", "bookmarking"], "relevance": "high"}
+    parsed, error = try_validate_payload(payload, "Bookmarked it for comparison later.")
+    assert error == ""
+    assert parsed is not None
+    assert parsed.wishlist_behavior == ["comparison", "bookmarking"]
+
+
+def test_other_list_fields_empty_string_normalize_to_empty_list():
+    from app.schemas import ReviewAnalysisSchema
+
+    parsed = ReviewAnalysisSchema.model_validate(
+        {
+            "purchase_barriers": "",
+            "uncertainties": None,
+            "themes": "fit",
+            "problems": [],
+        }
+    )
+    assert parsed.purchase_barriers == []
+    assert parsed.uncertainties == []
+    assert parsed.themes == ["fit"]
+    assert parsed.problems == []
+
+
 def test_opportunity_score_is_deterministic():
     assert opportunity_score(5, 5, 5, 5, 5) == 3125
     assert opportunity_score(1, 1, 1, 1, 1) == 1

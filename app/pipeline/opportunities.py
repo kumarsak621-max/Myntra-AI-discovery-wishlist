@@ -8,6 +8,7 @@ from collections import defaultdict
 from sqlalchemy.orm import Session
 
 from app.models import Opportunity, Review, utcnow
+from app.pipeline.labels import normalize_label
 from app.pipeline.quantification import label_distribution, pct
 from app.pipeline.scoring import (
     evidence_confidence_from_sources,
@@ -50,7 +51,9 @@ def rebuild_opportunities(db: Session) -> list[Opportunity]:
     built: list[Opportunity] = []
     seen_keys: set[str] = set()
     for kind, item, is_myntra_primary in candidates:
-        key = f"{kind}:{item['label'].lower()}"
+        key = f"{kind}:{(normalize_label(item.get('label')) or '').lower()}"
+        if not normalize_label(item.get("label")):
+            continue
         if key in seen_keys:
             continue
         seen_keys.add(key)

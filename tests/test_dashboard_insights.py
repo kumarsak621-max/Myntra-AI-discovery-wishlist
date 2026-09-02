@@ -110,14 +110,56 @@ def test_root_cause_hierarchy_uses_review_ids(db):
     assert rows[0]["count"] >= 1
 
 
+def test_pm_insight_card_and_root_cause_require_evidence():
+    from dashboard.insights import derive_root_cause, pm_insight_card
+
+    card = pm_insight_card(analyzed=0, problems=[], opportunities=[])
+    assert "insufficient" in card["strongest_signal"].lower()
+    root = derive_root_cause(
+        analyzed=0,
+        problems=[],
+        barriers=[],
+        uncertainties=[],
+        wishlist=[],
+    )
+    assert root["statement"] == "Insufficient evidence to establish a reliable root cause."
+    root2 = derive_root_cause(
+        analyzed=20,
+        problems=[{"problem": "Size chart missing", "frequency": 8}],
+        barriers=[{"label": "Size/fit", "count": 6}],
+        uncertainties=[{"label": "fit", "count": 5}],
+        wishlist=[{"label": "saving for later", "count": 4}],
+        hesitation_count=7,
+    )
+    assert root2["supported"] is True
+    assert "Size chart missing" in root2["statement"]
+    assert "saving for later" in root2["statement"]
+    assert "30-day" in root2["statement"]
+
+
+def test_pm_insight_card_uses_top_problem():
+    from dashboard.insights import pm_insight_card
+
+    card = pm_insight_card(
+        analyzed=40,
+        problems=[{"problem": "Delayed delivery", "frequency": 11, "confidence": 4}],
+        opportunities=[],
+        example="Delivery took 12 days",
+    )
+    assert card["strongest_signal"] == "Delayed delivery"
+    assert "11" in card["evidence"]
+    assert "Delivery took 12 days" in card["evidence"]
+    assert "conversion" in card["caveat"].lower()
+
+
 def test_discovery_questions_insufficient_without_analysis(db):
     from dashboard.questions import answer_discovery_questions
+    from dashboard.chat import ask_product_assistant
 
     cards = answer_discovery_questions(db, {"themes": [], "problems": []}, analyzed=0)
     assert len(cards) == 10
     assert all("insufficient" in c["answer"].lower() for c in cards)
-    from dashboard.chat import ask_product_assistant
-
     result = ask_product_assistant(db, "What do Martian shoppers think?", analyzed=0)
     assert "enough evidence" in result["answer"].lower() or "insufficient" in result["answer"].lower()
     assert result["supporting_review_count"] == 0
+    assert result.get("caveat")

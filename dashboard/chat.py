@@ -8,7 +8,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.models import Opportunity, Review, Segment, Theme
-from app.pipeline.labels import merge_category_rows, normalize_category_label
+from app.pipeline.labels import merge_category_rows, normalize_label
 from app.pipeline.quantification import _loads, problem_rows
 from config.settings import official_ids
 
@@ -70,7 +70,7 @@ def retrieve_evidence(db: Session, question: str, *, limit: int = 8) -> dict[str
         [
             {"name": t.name, "count": t.review_count, "evidence_ids": []}
             for t in db.query(Theme).order_by(Theme.review_count.desc()).all()
-            if any(tok in normalize_category_label(t.name).lower() for tok in tokens) or "theme" in q
+            if any(tok in (normalize_label(t.name) or "").lower() for tok in tokens) or "theme" in q
         ],
         label_keys=("name", "label"),
         count_keys=("count", "review_count"),
@@ -79,7 +79,7 @@ def retrieve_evidence(db: Session, question: str, *, limit: int = 8) -> dict[str
         [
             {"name": o.name, "score": o.score, "count": o.relevant_count}
             for o in db.query(Opportunity).order_by(Opportunity.rank.asc()).all()
-            if any(tok in normalize_category_label(o.name).lower() for tok in tokens) or "opportunit" in q
+            if any(tok in (normalize_label(o.name) or "").lower() for tok in tokens) or "opportunit" in q
         ],
         label_keys=("name", "label"),
         count_keys=("count", "relevant_count"),
@@ -88,7 +88,7 @@ def retrieve_evidence(db: Session, question: str, *, limit: int = 8) -> dict[str
         [
             {"name": s.name, "count": s.review_count}
             for s in db.query(Segment).order_by(Segment.review_count.desc()).all()
-            if any(tok in normalize_category_label(s.name).lower() for tok in tokens) or "segment" in q
+            if any(tok in (normalize_label(s.name) or "").lower() for tok in tokens) or "segment" in q
         ],
         label_keys=("name", "label"),
         count_keys=("count", "review_count"),
@@ -114,6 +114,9 @@ def answer_from_evidence(question: str, evidence: dict[str, Any], *, analyzed: i
     problems = evidence.get("problems") or []
     opportunities = evidence.get("opportunities") or []
     themes = evidence.get("themes") or []
+    problems = [p for p in problems if normalize_label(p.get("problem") or p.get("label"))]
+    themes = [t for t in themes if normalize_label(t.get("name") or t.get("label"))]
+    opportunities = [o for o in opportunities if normalize_label(o.get("name") or o.get("label"))]
     if analyzed <= 0 and not reviews:
         return {
             "answer": "I don't have enough evidence in the collected review dataset to answer this reliably.",
@@ -123,6 +126,8 @@ def answer_from_evidence(question: str, evidence: dict[str, Any], *, analyzed: i
             "review_ids": [],
             "confidence": None,
             "pm_implication": "Collect and analyze real reviews before drawing product conclusions.",
+            "caveat": "Public reviews are proxy evidence only and do not measure wishlist conversion.",
+            "quotes": [],
         }
     if not reviews and not problems and not opportunities:
         return {
@@ -133,6 +138,8 @@ def answer_from_evidence(question: str, evidence: dict[str, Any], *, analyzed: i
             "review_ids": [],
             "confidence": None,
             "pm_implication": "Try a more specific term that appears in stored barriers, problems, or review text.",
+            "caveat": "No matching stored evidence was retrieved for this question.",
+            "quotes": [],
         }
 
     top_problem = problems[0]["problem"] if problems else None
@@ -184,6 +191,7 @@ def answer_from_evidence(question: str, evidence: dict[str, Any], *, analyzed: i
             for r in reviews[:5]
             if r.get("text")
         ],
+        "caveat": "Public reviews are proxy evidence only and do not measure actual wishlist-to-purchase conversion.",
     }
 
 

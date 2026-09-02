@@ -24,14 +24,34 @@ def test_official_myntra_ids_are_defaults():
 
 def test_default_openrouter_model_without_key():
     settings = Settings(openrouter_api_key="", openrouter_model="")
-    assert settings.resolved_model == "google/gemini-2.5-flash"
+    assert settings.resolved_model == "google/gemini-2.5-flash-lite"
     assert settings.has_ai_credentials is False
     assert settings.ai_provider == "openrouter"
+    assert settings.ai_model == "google/gemini-2.5-flash-lite"
+
+
+def test_ai_model_fills_in_when_openrouter_model_is_default():
+    settings = Settings(
+        openrouter_model="google/gemini-2.5-flash-lite",
+        ai_model="google/gemini-2.5-flash",
+    )
+    assert settings.resolved_model == "google/gemini-2.5-flash"
+    assert settings.openrouter_model == "google/gemini-2.5-flash"
+
+
+def test_openrouter_model_wins_when_not_the_default():
+    settings = Settings(
+        openrouter_model="google/gemini-2.5-flash",
+        ai_model="google/gemini-2.5-flash-lite",
+    )
+    assert settings.resolved_model == "google/gemini-2.5-flash"
 
 
 def test_normalize_adds_google_prefix_for_bare_gemini():
     assert normalize_openrouter_model("gemini-2.5-flash") == "google/gemini-2.5-flash"
     assert normalize_openrouter_model("google/gemini-2.5-flash") == "google/gemini-2.5-flash"
+    assert normalize_openrouter_model("gemini-2.5-flash-lite") == "google/gemini-2.5-flash-lite"
+    assert normalize_openrouter_model("") == "google/gemini-2.5-flash-lite"
 
 
 def test_streamlit_secret_is_none_outside_streamlit():

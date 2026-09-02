@@ -2,12 +2,69 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
 from app.pipeline.labels import is_placeholder_label, stored_category_text
+
+
+STRING_LIST_FIELDS = (
+    "intent",
+    "barriers",
+    "uncertainties",
+    "product_category",
+    "decision_factors",
+    "problems",
+    "wishlist_behavior",
+    "purchase_barriers",
+    "themes",
+    "segments",
+    "comparison_factors",
+    "external_information_seeking",
+    "social_validation",
+)
+
+
+def coerce_string_list(value: Any) -> list[str]:
+    """Normalize AI list fields. Never invent labels; empty evidence becomes []."""
+    if value is None or value is False:
+        return []
+    if value is True:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text.lower() in {"null", "none", "n/a", "na", "[]"}:
+            return []
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                return coerce_string_list(parsed)
+        return [text]
+    if isinstance(value, list):
+        items: list[str] = []
+        for item in value:
+            if item is None or item is False or item == "":
+                continue
+            if isinstance(item, str):
+                text = item.strip()
+                if text:
+                    items.append(text)
+            elif isinstance(item, (int, float)) and not isinstance(item, bool):
+                items.append(str(item))
+            elif isinstance(item, dict):
+                raise ValueError("expected a list of strings, got an object")
+        return items
+    if isinstance(value, (int, float)):
+        return [str(value)]
+    if isinstance(value, dict):
+        raise ValueError("expected a list of strings, got an object")
+    return []
 
 
 class SourceValidation(BaseModel):
@@ -135,6 +192,26 @@ class ReviewAnalysisSchema(BaseModel):
         if value in {True, 1, "1", "true", "True"}:
             return "implicit"
         return value
+
+    @field_validator(
+        "intent",
+        "barriers",
+        "uncertainties",
+        "product_category",
+        "decision_factors",
+        "problems",
+        "wishlist_behavior",
+        "purchase_barriers",
+        "themes",
+        "segments",
+        "comparison_factors",
+        "external_information_seeking",
+        "social_validation",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_lists(cls, value: Any) -> list[str]:
+        return coerce_string_list(value)
 
     @field_validator(
         "intent",

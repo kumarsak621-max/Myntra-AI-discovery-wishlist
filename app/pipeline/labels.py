@@ -1,16 +1,15 @@
 """Normalize missing/empty category labels before aggregation and charts.
 
-AI outputs and clustering uniqueness used to produce:
-none, none (2), none (3), none (4)
-Those are the same missing-value bucket and must display as one Uncategorized row.
+Placeholder values such as none / None / N/A must never become chart categories,
+opportunity names, or discovery findings.
 """
 
 from __future__ import annotations
 
 import re
-from collections import defaultdict
 from typing import Any
 
+# Kept for older callers; treated as missing if it appears as a stored label.
 UNCATEGORIZED = "Uncategorized"
 
 _MISSING_EXACT = {
@@ -23,93 +22,81 @@ _MISSING_EXACT = {
     "na",
     "unknown",
     "undefined",
+    "uncategorized",
+    "no evidence",
+    "not mentioned",
+    "not specified",
+    "none mentioned",
+    "no mention",
     "-",
     "--",
     ".",
 }
 
 _MISSING_SUFFIX = re.compile(
-    r"^(none|null|n/?a|na|unknown|undefined|nil|nan)(\s*\(\d+\))?$",
+    r"^(none|null|n/?a|na|unknown|undefined|nil|nan|uncategorized)(\s*\(\d+\))?$",
     re.IGNORECASE,
 )
 
 
-def normalize_category_label(value: Any) -> str:
-    """Map missing/placeholder labels to Uncategorized. Keep real category text."""
-    if value is None:
-        return UNCATEGORIZED
+def normalize_label(value: Any) -> str | None:
+    """Return a cleaned label, or None when the value is missing/placeholder."""
+    if value is None or value is False:
+        return None
     if isinstance(value, float) and value != value:  # NaN
-        return UNCATEGORIZED
+        return None
     text = " ".join(str(value).split()).strip()
     if not text:
-        return UNCATEGORIZED
-    if text.lower() == UNCATEGORIZED.lower():
-        return UNCATEGORIZED
-    if text.lower() in _MISSING_EXACT:
-        return UNCATEGORIZED
+        return None
+    lowered = text.lower()
+    if lowered in _MISSING_EXACT:
+        return None
     if _MISSING_SUFFIX.fullmatch(text):
-        return UNCATEGORIZED
+        return None
     return text
 
 
+def normalize_category_label(value: Any) -> str:
+    """Compatibility wrapper. Missing labels become '' rather than a fake category."""
+    return normalize_label(value) or ""
+
+
 def is_placeholder_label(value: Any) -> bool:
-    """True for missing/null/none/none (N) values — not for a real 'Uncategorized' label."""
-    if value is None:
-        return True
-    if isinstance(value, float) and value != value:
-        return True
-    text = " ".join(str(value).split()).strip()
-    if not text:
-        return True
-    if text.lower() == UNCATEGORIZED.lower():
-        return False
-    return normalize_category_label(text) == UNCATEGORIZED
+    return normalize_label(value) is None
 
 
 def stored_category_text(value: Any) -> str:
     """Persist empty string for placeholders; keep meaningful labels."""
-    if is_placeholder_label(value):
-        return ""
-    return " ".join(str(value).split()).strip()
+    return normalize_label(value) or ""
 
 
-def normalize_label_list(values: Any, *, keep_uncategorized_if_only_missing: bool = True) -> list[str]:
-    """Normalize a list of labels. Dummy 'none' items are dropped when real labels exist."""
+def normalize_label_list(values: Any, *, keep_uncategorized_if_only_missing: bool = False) -> list[str]:
+    """Normalize a list of labels. Placeholders are dropped and never displayed."""
+    del keep_uncategorized_if_only_missing  # never keep a fake missing category
     if values is None:
         return []
     if isinstance(values, (str, bytes)):
         values = [values]
     real: list[str] = []
     seen: set[str] = set()
-    saw_placeholder = False
     for item in values:
-        if is_placeholder_label(item):
-            saw_placeholder = True
+        label = normalize_label(item)
+        if not label:
             continue
-        label = normalize_category_label(item)
         key = label.lower()
         if key in seen:
             continue
         seen.add(key)
         real.append(label)
-    if real:
-        return real
-    if keep_uncategorized_if_only_missing and saw_placeholder:
-        return [UNCATEGORIZED]
-    return []
+    return real
 
 
 def validate_chart_categories(labels: list[Any] | None) -> list[str]:
-    """Return leftover duplicate-missing labels that should not be rendered."""
+    """Return leftover missing labels that should not be rendered."""
     issues: list[str] = []
     for raw in labels or []:
-        text = " ".join(str(raw or "").split()).strip()
-        if not text:
-            continue
-        if text.lower() == UNCATEGORIZED.lower():
-            continue
-        if text.lower() in _MISSING_EXACT or _MISSING_SUFFIX.fullmatch(text):
-            issues.append(text)
+        if normalize_label(raw) is None and str(raw or "").strip():
+            issues.append(str(raw).strip())
     return sorted(set(issues))
 
 
@@ -120,7 +107,7 @@ def merge_category_rows(
     count_keys: tuple[str, ...] = ("count", "frequency", "review_count", "relevant_count"),
     id_keys: tuple[str, ...] = ("review_ids", "evidence_ids"),
 ) -> list[dict[str, Any]]:
-    """Normalize labels then sum counts and union review ids. One Uncategorized row max."""
+    """Normalize labels then sum counts. Placeholder labels are omitted entirely."""
     buckets: dict[str, dict[str, Any]] = {}
     order: list[str] = []
     for row in rows or []:
@@ -129,7 +116,9 @@ def merge_category_rows(
             if row.get(key) not in (None, ""):
                 raw_label = row.get(key)
                 break
-        label = normalize_category_label(raw_label)
+        label = normalize_label(raw_label)
+        if not label:
+            continue
         count = 0
         for key in count_keys:
             if row.get(key) not in (None, ""):

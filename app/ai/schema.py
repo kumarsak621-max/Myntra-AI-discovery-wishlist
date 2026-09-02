@@ -13,6 +13,8 @@ from app.schemas import (
     InformationSeekingItem,
     ReviewAnalysisSchema,
     RootCauseItem,
+    STRING_LIST_FIELDS,
+    coerce_string_list,
 )
 from app.pipeline.labels import is_placeholder_label, stored_category_text
 
@@ -202,6 +204,23 @@ def try_validate_payload(
     if cleaned.get("purchase_barrier") and not cleaned.get("purchase_signal"):
         cleaned["purchase_signal"] = "hesitant"
         cleaned["purchase_hesitation"] = cleaned.get("purchase_hesitation") or "implicit"
+
+    for key in ("information_seeking", "behavioral_signals"):
+        value = cleaned.get(key)
+        if value in (None, "", False):
+            cleaned[key] = []
+        elif isinstance(value, dict):
+            cleaned[key] = [value]
+        elif isinstance(value, str):
+            cleaned[key] = []
+
+    for key in STRING_LIST_FIELDS:
+        if key not in cleaned:
+            continue
+        try:
+            cleaned[key] = coerce_string_list(cleaned.get(key))
+        except (TypeError, ValueError) as exc:
+            return None, f"AI response failed schema validation: {key}: {exc}"
 
     def _as_list(value: Any) -> list[str]:
         if not value:

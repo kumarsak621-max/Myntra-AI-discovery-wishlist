@@ -9,7 +9,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from app.pipeline.labels import merge_category_rows, normalize_category_label, validate_chart_categories
+from app.pipeline.labels import merge_category_rows, normalize_label, validate_chart_categories
 
 logger = logging.getLogger(__name__)
 EMPTY = "Insufficient evidence for this visualization."
@@ -24,7 +24,9 @@ def _assert_clean(labels: list[str]) -> None:
 def _frame(rows: list[dict[str, Any]] | None, *, label="label", count="count") -> pd.DataFrame:
     prepared = []
     for row in rows or []:
-        name = normalize_category_label(row.get(label) or row.get("problem") or row.get("name") or row.get("root_cause"))
+        name = normalize_label(row.get(label) or row.get("problem") or row.get("name") or row.get("root_cause"))
+        if not name:
+            continue
         value = row.get(count) or row.get("frequency") or row.get("review_count") or 0
         try:
             value = int(value)
@@ -83,14 +85,17 @@ def donut_chart(rows: list[dict[str, Any]] | None, *, empty: str = EMPTY) -> Non
             .properties(height=280)
         )
         st.altair_chart(chart, use_container_width=True)
-    except Exception:
+    except Exception as exc:
+        logger.warning("Donut chart failed (%s); using bar fallback", exc)
         st.bar_chart(df.set_index("label")["count"], height=260)
 
 
 def heatmap_impact_frequency(rows: list[dict[str, Any]] | None, *, empty: str = EMPTY) -> None:
     buckets: dict[str, dict[str, int]] = defaultdict(lambda: {"frequency": 0, "impact": 0})
     for row in rows or []:
-        label = normalize_category_label(row.get("label") or row.get("barrier") or row.get("problem") or "")
+        label = normalize_label(row.get("label") or row.get("barrier") or row.get("problem") or "")
+        if not label:
+            continue
         freq = int(row.get("count") or row.get("frequency") or 0)
         impact = int(row.get("purchase_impact") or row.get("impact") or row.get("hesitant_count") or 0)
         if freq:
@@ -121,7 +126,8 @@ def heatmap_impact_frequency(rows: list[dict[str, Any]] | None, *, empty: str = 
             .properties(height=max(180, 28 * len(df)))
         )
         st.altair_chart(chart, use_container_width=True)
-    except Exception:
+    except Exception as exc:
+        logger.warning("Impact heatmap failed (%s); using table fallback", exc)
         st.dataframe(df, hide_index=True, width="stretch")
 
 
@@ -130,7 +136,9 @@ def trend_frame(rows: list[dict[str, Any]] | None, *, label_key: str = "theme") 
     buckets: dict[tuple[str, str], int] = defaultdict(int)
     for row in rows or []:
         day = str(row.get("day") or "").strip()
-        name = normalize_category_label(row.get(label_key) or row.get("label") or row.get("theme"))
+        name = normalize_label(row.get(label_key) or row.get("label") or row.get("theme"))
+        if not name:
+            continue
         try:
             value = int(row.get("count") or 0)
         except (TypeError, ValueError):

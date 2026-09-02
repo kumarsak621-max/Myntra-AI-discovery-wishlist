@@ -232,11 +232,34 @@ def test_connection_test_success(monkeypatch):
     assert result["error"] is None
     assert result["credentials"] == "Configured"
     assert client.calls[0]["json"]["model"] == "google/gemini-2.5-flash"
+    assert client.calls[0]["json"]["max_tokens"] == 100
+    assert client.calls[0]["json"]["max_tokens"] != 65535
+    assert result["max_tokens"] == 100
     assert "response_format" not in client.calls[0]["json"]
     messages = client.calls[0]["json"]["messages"]
     assert messages[0]["role"] == "system"
     assert messages[1]["role"] == "user"
     assert "unit-test-key" not in str(result)
+
+
+def test_connection_test_402_fails_fast(monkeypatch):
+    client = FakeClient(
+        [FakeResponse(402, text='{"error":{"message":"You requested up to 65535 tokens"}}')]
+    )
+    monkeypatch.setattr("httpx.Client", lambda *a, **k: client)
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    result = probe_openrouter_connection(
+        Settings(openrouter_api_key="unit-test-key", openrouter_model="google/gemini-2.5-flash-lite")
+    )
+    assert result["ok"] is False
+    assert result["status"] == "FAILED"
+    assert result["http_status"] == 402
+    assert "credit" in (result["error"] or "").lower()
+    assert len(client.calls) == 1
+    assert client.calls[0]["json"]["max_tokens"] == 100
+    assert client.calls[0]["json"]["max_tokens"] != 65535
+    assert "unit-test-key" not in str(result)
+    assert "65535" not in (result["error"] or "")
 
 
 def test_missing_key_does_not_call_openrouter(monkeypatch):

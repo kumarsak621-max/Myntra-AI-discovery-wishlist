@@ -14,7 +14,7 @@ from collections import Counter, defaultdict
 from sqlalchemy.orm import Session
 
 from app.models import Review, Theme, utcnow
-from app.pipeline.labels import UNCATEGORIZED, normalize_category_label, normalize_label_list
+from app.pipeline.labels import normalize_label, normalize_label_list
 
 logger = logging.getLogger(__name__)
 
@@ -84,9 +84,13 @@ def discover_themes(db: Session) -> list[Theme]:
         sources: dict[str, set[str]] = defaultdict(set)
         myntra_c: Counter[str] = Counter()
         for review in analyzed:
-            bag = _label_bag(review) or [UNCATEGORIZED]
+            bag = _label_bag(review)
+            if not bag:
+                continue
             for label in bag:
-                key = normalize_category_label(label)[:120]
+                key = (normalize_label(label) or "")[:120]
+                if not key:
+                    continue
                 freq[key] += 1
                 owners[key].append(review.id)
                 sources[key].add(review.source)
@@ -94,8 +98,11 @@ def discover_themes(db: Session) -> list[Theme]:
                     myntra_c[key] += 1
         themes: list[Theme] = []
         for name, count in freq.most_common(20):
+            clean = normalize_label(name)
+            if not clean:
+                continue
             theme = Theme(
-                name=normalize_category_label(name)[:255],
+                name=clean[:255],
                 description="Emergent label cluster (small corpus — frequency grouping).",
                 cluster_key="label-freq",
                 review_count=count,
@@ -148,13 +155,17 @@ def discover_themes(db: Session) -> list[Theme]:
         ids: list[int] = []
         for review in members:
             for lab in _label_bag(review):
-                label_freq[normalize_category_label(lab)[:120]] += 1
+                key = normalize_label(lab)
+                if key:
+                    label_freq[key[:120]] += 1
             sources.add(review.source)
             ids.append(review.id)
             if review.is_valid_source:
                 myntra_n += 1
-        raw_name = label_freq.most_common(1)[0][0] if label_freq else UNCATEGORIZED
-        name = normalize_category_label(raw_name)
+        raw_name = label_freq.most_common(1)[0][0] if label_freq else ""
+        name = normalize_label(raw_name)
+        if not name:
+            continue
         top_terms = []
         if len(order_centroids):
             top_terms = [str(terms[i]) for i in order_centroids[cid][:8]]

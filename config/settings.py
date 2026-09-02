@@ -27,7 +27,8 @@ OFFICIAL_APPLE_APP_NAME = "Myntra Fashion Shopping App"
 # Must never be used for Myntra collection.
 BANNED_APP_IDS = frozenset({"com.grofers.customerapp", "960335206"})
 
-DEFAULT_OPENROUTER_MODEL = "google/gemini-2.5-flash"
+DEFAULT_OPENROUTER_MODEL = "google/gemini-2.5-flash-lite"
+FALLBACK_OPENROUTER_MODEL = "google/gemini-2.5-flash"
 
 
 def normalize_openrouter_model(value: str | None) -> str:
@@ -211,10 +212,24 @@ class Settings(BaseSettings):
     def _force_openrouter_provider(self):
         """Leftover Gemini env vars must not switch the production path."""
         self.ai_provider = "openrouter"
-        if not (self.openrouter_model or "").strip():
-            self.openrouter_model = DEFAULT_OPENROUTER_MODEL
-        if not (self.ai_model or "").strip():
-            self.ai_model = DEFAULT_OPENROUTER_MODEL
+        openrouter_model = (self.openrouter_model or "").strip()
+        ai_model = (self.ai_model or "").strip()
+        if openrouter_model:
+            chosen = openrouter_model
+        elif ai_model:
+            chosen = ai_model
+        else:
+            chosen = DEFAULT_OPENROUTER_MODEL
+        # If only AI_MODEL was set, the OPENROUTER_MODEL field still has the default.
+        if (
+            openrouter_model
+            and ai_model
+            and normalize_openrouter_model(openrouter_model) == DEFAULT_OPENROUTER_MODEL
+            and normalize_openrouter_model(ai_model) != DEFAULT_OPENROUTER_MODEL
+        ):
+            chosen = ai_model
+        self.openrouter_model = normalize_openrouter_model(chosen)
+        self.ai_model = self.openrouter_model
         token_cap = self.max_output_tokens if self.max_output_tokens is not None else self.ai_max_tokens
         self.ai_max_tokens = clamp_max_tokens(token_cap)
         batch = (
@@ -333,11 +348,10 @@ def _env_settings() -> Settings:
         file_key = normalize_openrouter_api_key(file_vals.get("OPENROUTER_API_KEY"))
         if file_key:
             settings.openrouter_api_key = file_key
-    if not (settings.openrouter_model or "").strip():
-        file_model = file_vals.get("OPENROUTER_MODEL") or ""
-        if file_model:
-            settings.openrouter_model = file_model
-            settings.ai_model = file_model
+    file_model = (file_vals.get("OPENROUTER_MODEL") or file_vals.get("AI_MODEL") or "").strip()
+    if file_model and not (os.getenv("OPENROUTER_MODEL") or "").strip() and not (os.getenv("AI_MODEL") or "").strip():
+        settings.openrouter_model = normalize_openrouter_model(file_model)
+        settings.ai_model = settings.openrouter_model
     settings.openrouter_api_key = normalize_openrouter_api_key(settings.openrouter_api_key)
     settings.ai_provider = "openrouter"
     return settings
@@ -351,10 +365,10 @@ def get_settings() -> Settings:
         settings.openrouter_api_key = creds["key"]
     else:
         settings.openrouter_api_key = normalize_openrouter_api_key(settings.openrouter_api_key)
-    secret_model = _streamlit_secret("OPENROUTER_MODEL")
+    secret_model = _streamlit_secret("OPENROUTER_MODEL") or _streamlit_secret("AI_MODEL")
     if secret_model:
-        settings.openrouter_model = secret_model
-        settings.ai_model = secret_model
+        settings.openrouter_model = normalize_openrouter_model(secret_model)
+        settings.ai_model = settings.openrouter_model
     secret_tokens = _streamlit_secret("AI_MAX_TOKENS") or _streamlit_secret("MAX_OUTPUT_TOKENS")
     if secret_tokens:
         settings.ai_max_tokens = clamp_max_tokens(secret_tokens)

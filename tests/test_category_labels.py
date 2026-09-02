@@ -7,12 +7,13 @@ from app.pipeline.labels import (
     UNCATEGORIZED,
     merge_category_rows,
     normalize_category_label,
+    normalize_label,
     normalize_label_list,
     validate_chart_categories,
 )
 
 
-def test_normalize_category_label_maps_placeholders():
+def test_normalize_label_maps_placeholders_to_none():
     samples = [
         None,
         "",
@@ -33,26 +34,30 @@ def test_normalize_category_label_maps_placeholders():
         "none (3)",
         "none (4)",
         "None (2)",
+        "no evidence",
+        "not mentioned",
+        UNCATEGORIZED,
     ]
     for value in samples:
-        assert normalize_category_label(value) == UNCATEGORIZED, value
+        assert normalize_label(value) is None, value
+        assert normalize_category_label(value) == ""
 
 
 def test_normalize_keeps_real_labels():
-    assert normalize_category_label("Size & Fit") == "Size & Fit"
-    assert normalize_category_label("  Price  ") == "Price"
-    assert normalize_category_label("Delivery") == "Delivery"
-    assert normalize_category_label("Returns") == "Returns"
-    assert normalize_category_label("Quality") == "Quality"
+    assert normalize_label("Size & Fit") == "Size & Fit"
+    assert normalize_label("  Price  ") == "Price"
+    assert normalize_label("Delivery") == "Delivery"
+    assert normalize_label("Returns") == "Returns"
+    assert normalize_label("Quality") == "Quality"
 
 
-def test_normalize_label_list_drops_dummy_none_when_real_exists():
+def test_normalize_label_list_drops_placeholders():
     assert normalize_label_list(["Price", "none", "none (2)"]) == ["Price"]
-    assert normalize_label_list(["none", "None", "none (3)"]) == [UNCATEGORIZED]
+    assert normalize_label_list(["none", "None", "none (3)"]) == []
     assert normalize_label_list([]) == []
 
 
-def test_merge_collapses_duplicate_missing_and_keeps_ids():
+def test_merge_drops_placeholder_rows_entirely():
     rows = [
         {"label": "none", "count": 5, "review_ids": [1, 2]},
         {"label": "none (2)", "count": 3, "review_ids": [3]},
@@ -61,22 +66,22 @@ def test_merge_collapses_duplicate_missing_and_keeps_ids():
     ]
     merged = merge_category_rows(rows)
     labels = [r["label"] for r in merged]
-    assert labels.count(UNCATEGORIZED) == 1
+    assert labels == ["Size & Fit"]
     assert "none (2)" not in labels
-    uncat = next(r for r in merged if r["label"] == UNCATEGORIZED)
-    assert uncat["count"] == 10
-    assert uncat["review_ids"] == [1, 2, 3, 4, 5]
+    assert UNCATEGORIZED not in labels
+    assert merged[0]["count"] == 4
+    assert merged[0]["review_ids"] == [6]
 
 
 def test_validate_chart_categories_flags_raw_missing():
     issues = validate_chart_categories(["none", "none (2)", "Size & Fit", UNCATEGORIZED])
     assert "none" in issues
     assert "none (2)" in issues
-    assert UNCATEGORIZED not in issues
-    assert not validate_chart_categories([UNCATEGORIZED, "Size & Fit"])
+    assert UNCATEGORIZED in issues
+    assert not validate_chart_categories(["Size & Fit"])
 
 
-def test_chart_frame_aggregates_before_render():
+def test_chart_frame_omits_placeholder_only_data():
     from dashboard.charts import _frame, trend_frame
 
     df = _frame(
@@ -87,9 +92,8 @@ def test_chart_frame_aggregates_before_render():
             {"label": "none (4)", "count": 6},
         ]
     )
-    assert list(df["label"]) == [UNCATEGORIZED]
-    assert int(df["count"].sum()) == 42
-    assert validate_chart_categories(list(df["label"])) == []
+    assert df.empty
+    assert validate_chart_categories(list(df["label"]) if not df.empty else []) == []
 
     trend = trend_frame(
         [
@@ -98,8 +102,7 @@ def test_chart_frame_aggregates_before_render():
             {"day": "2026-08-02", "theme": "None", "count": 1},
         ]
     )
-    assert set(trend["theme"]) == {UNCATEGORIZED}
-    assert int(trend.loc[trend["day"] == "2026-08-01", "count"].sum()) == 5
+    assert trend.empty
 
 
 def _analyzed_review(db, source_id: str, *, barriers: str, root_cause: str = "") -> Review:
@@ -137,7 +140,7 @@ def _analyzed_review(db, source_id: str, *, barriers: str, root_cause: str = "")
     return row
 
 
-def test_label_distribution_merges_placeholder_barriers(db):
+def test_label_distribution_drops_placeholder_barriers(db):
     from app.pipeline.quantification import label_distribution, root_cause_distribution
 
     _analyzed_review(db, "n1", barriers='["none"]', root_cause="none")
@@ -146,22 +149,18 @@ def test_label_distribution_merges_placeholder_barriers(db):
     _analyzed_review(db, "n4", barriers='["Size & Fit"]', root_cause="size chart missing")
     barriers = label_distribution(db, "barriers", myntra_only=True, relevant_only=False)
     labels = [r["label"] for r in barriers]
-    assert labels.count(UNCATEGORIZED) == 1
+    assert labels == ["Size & Fit"]
     assert "none (2)" not in labels
-    uncat = next(r for r in barriers if r["label"] == UNCATEGORIZED)
-    assert uncat["count"] == 3
-    assert len(uncat["review_ids"]) == 3
-    assert any(r["label"] == "Size & Fit" for r in barriers)
+    assert UNCATEGORIZED not in labels
 
     roots = root_cause_distribution(db, myntra_only=True)
     root_labels = [r["label"] for r in roots]
-    assert root_labels.count(UNCATEGORIZED) == 1
-    assert "none (2)" not in root_labels
+    assert root_labels == ["size chart missing"]
     assert "none" not in root_labels
-    assert any(r["label"] == "size chart missing" for r in roots)
+    assert UNCATEGORIZED not in root_labels
 
 
-def test_clustering_merges_none_theme_names(db):
+def test_clustering_skips_none_theme_names(db):
     from app.pipeline.clustering import discover_themes
 
     for i in range(2):
@@ -169,11 +168,9 @@ def test_clustering_merges_none_theme_names(db):
     themes = discover_themes(db)
     names = [t.name for t in themes]
     assert "none (2)" not in names
-    assert "none (3)" not in names
-    assert names.count("none") == 0
-    assert names.count(UNCATEGORIZED) == 1
-    assert themes[0].review_count == 2
-    assert themes[0].evidence_ids_json
+    assert "none" not in names
+    assert UNCATEGORIZED not in names
+    assert names == []
 
 
 def test_compact_none_problem_does_not_invent_root_cause():
