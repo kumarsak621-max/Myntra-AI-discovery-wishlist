@@ -67,6 +67,7 @@ from dashboard.insights import (
     wishlist_conversion_copy,
 )
 from dashboard.pipeline_status import derive_failed_reason, insights_status_for_analyze
+from dashboard.questions import DISCOVERY_QUESTIONS
 
 LOGGER = logging.getLogger("myntra.discovery")
 

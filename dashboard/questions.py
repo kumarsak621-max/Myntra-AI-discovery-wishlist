@@ -7,7 +7,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from dashboard.chat import ask_product_assistant, retrieve_evidence
-from dashboard.insights import pm_insight
+from dashboard.insights import derive_root_cause, pm_insight
 from app.pipeline.labels import normalize_label
 
 DISCOVERY_QUESTIONS = [
@@ -16,11 +16,12 @@ DISCOVERY_QUESTIONS = [
     "What uncertainties remain after users identify a product?",
     "What causes users to postpone a purchase?",
     "How do users compare shortlisted products?",
-    "What information do users seek outside Myntra before purchasing?",
+    "What information do users seek outside Myntra/AJIO before purchasing?",
     "What role do fit, size, styling, price, reviews, occasion and social validation play?",
     "Which wishlist behaviors indicate genuine purchase intent?",
     "How do behaviors differ across user segments?",
     "What unmet needs emerge consistently?",
+    "What is the root cause of purchase hesitation?",
 ]
 
 INSUFFICIENT = "Insufficient direct evidence in the collected public reviews."
@@ -157,6 +158,18 @@ def answer_discovery_questions(db: Session, data: dict[str, Any], *, analyzed: i
             [{"label": s.get("name"), "count": s.get("review_count"), "review_ids": s.get("evidence_ids")} for s in segments],
         ),
         (DISCOVERY_QUESTIONS[9], pm_insight(topic="unmet need / user problem", rows=problems, analyzed=analyzed), problems),
+        (
+            DISCOVERY_QUESTIONS[10],
+            derive_root_cause(
+                analyzed=analyzed,
+                problems=problems,
+                barriers=barriers,
+                uncertainties=uncertainties,
+                wishlist=wishlist,
+                hesitation_count=int((data.get("signals") or {}).get("purchase_hesitation") or 0),
+            )["statement"],
+            problems or barriers or uncertainties or wishlist,
+        ),
     ]
 
     cards = []

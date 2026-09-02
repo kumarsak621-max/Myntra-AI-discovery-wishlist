@@ -157,7 +157,7 @@ def test_discovery_questions_insufficient_without_analysis(db):
     from dashboard.chat import ask_product_assistant
 
     cards = answer_discovery_questions(db, {"themes": [], "problems": []}, analyzed=0)
-    assert len(cards) == 10
+    assert len(cards) == 11
     assert all("insufficient" in c["answer"].lower() for c in cards)
     result = ask_product_assistant(db, "What do Martian shoppers think?", analyzed=0)
     assert "enough evidence" in result["answer"].lower() or "insufficient" in result["answer"].lower()
