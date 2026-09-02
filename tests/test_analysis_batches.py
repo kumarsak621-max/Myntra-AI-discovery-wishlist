@@ -50,7 +50,7 @@ def _insert(db, source_id: str, text: str) -> Review:
                 text=text,
                 title="Fit worry",
                 rating=3,
-                review_date=datetime(2026, 8, 1, tzinfo=timezone.utc),
+                review_date=datetime.now(timezone.utc),
                 is_valid_source=True,
                 data_classification="MYNTRA EVIDENCE",
             )

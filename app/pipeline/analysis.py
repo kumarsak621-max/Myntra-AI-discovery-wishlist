@@ -56,7 +56,7 @@ def remaining_analysis_limit(db: Session, settings) -> int:
     from app.pipeline.dataset import analysis_dataset_stats
 
     stats = analysis_dataset_stats(db)
-    return max(0, int(stats.get("pending_reviews") or 0) + int(stats.get("failed_reviews") or 0))
+    return max(0, int(stats.get("sample_pending") or 0) + int(stats.get("sample_failed") or 0))
 
 
 def smoke_test_analyze_limit(db: Session, settings) -> int:
@@ -342,7 +342,7 @@ def analyze_new_reviews(
         db, only_failed=only_failed, include_failed=include_failed
     )
     total_pending = len(pending)
-    already_analyzed = int(stats.get("analyzed_reviews") or 0)
+    already_analyzed = int(stats.get("sample_analyzed") or stats.get("analyzed_reviews") or 0)
     if limit is not None:
         pending = pending[:limit]
 

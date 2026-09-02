@@ -56,16 +56,20 @@ class CollectionEngine:
         validations: list[SourceValidation] = []
 
         def _collect_kwargs(source: str) -> dict[str, Any]:
-            cap = int(getattr(self.settings, "max_dataset_reviews", 300) or 300)
+            per_source = (
+                int(self.settings.google_play_max_reviews)
+                if source == "google_play"
+                else int(self.settings.apple_max_reviews)
+            )
             if mode == "last_30_days":
-                limit = (
+                safety = (
                     self.settings.google_play_window_safety_limit
                     if source == "google_play"
                     else self.settings.apple_window_safety_limit
                 )
-                return {"stop_when_older_than": cutoff, "safety_limit": min(int(limit), cap)}
+                return {"stop_when_older_than": cutoff, "safety_limit": min(int(safety), per_source)}
             limit = max_reviews if max_reviews is not None else self.settings.refresh_safety_limit
-            return {"max_reviews": min(int(limit), cap)}
+            return {"max_reviews": min(int(limit), per_source)}
 
         try:
             if "google_play" in wanted:
@@ -181,10 +185,8 @@ class CollectionEngine:
                     )
 
             from app.pipeline.dataset import enforce_review_limit
-            from config.settings import get_settings as _fresh_settings
 
-            if _fresh_settings().prune_excess_reviews:
-                enforce_review_limit(self.db)
+            enforce_review_limit(self.db, prune=True)
 
             if analyze:
                 if progress:

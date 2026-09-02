@@ -185,7 +185,7 @@ On **Live Data** use **Test OpenRouter Connection** to send a real OpenRouter re
 5. Rebuild themes, segments, and opportunity scores
 6. Refresh the dashboard
 
-If ~1300 reviews are already in the local database, the pipeline enforces `MAX_DATASET_REVIEWS` (default **300**), keeps the newest real Google Play and Apple reviews, and deletes the rest. It does not fabricate reviews to reach 300. Use **Collect Last 30 Days** only when you need new collection.
+If more reviews are already in the local database than `MAX_TOTAL_REVIEWS` (default **500**), storage is pruned to the newest real Google Play and Apple reviews. AI analysis uses at most `MAX_ANALYSIS_REVIEWS` (default **150**) of those stored reviews, in batches of 10. It does not fabricate reviews to reach either cap.
 
 ## Diagnostics
 
@@ -211,7 +211,7 @@ Prints database path and counts, collector status, OpenRouter configuration (nev
 
 The Streamlit dashboard is a single scrolling page: header, KPI cards, wishlist → purchase indicator, numbered discovery sections (problems through evidence explorer), the Product Manager assistant, and data limitations.
 
-The sidebar holds compact controls only (date range, source, rating, auto-refresh, analyze). There is no section-by-section navigation list.
+The sidebar holds compact controls only (date range, refresh, analyze). There is no Auto Refresh ON/OFF toggle. Sources are checked automatically every 5 minutes.
 
 Period defaults to **Last 30 Days** and can be switched to **All Time**. Last-30-day metrics use review timestamps only.
 
@@ -237,9 +237,12 @@ Default filter: **Myntra-valid evidence only**.
 ```toml
 OPENROUTER_API_KEY = "your_openrouter_key"
 OPENROUTER_MODEL = "google/gemini-2.5-flash"
-MAX_DATASET_REVIEWS = 300
+MAX_TOTAL_REVIEWS = 500
+MAX_DATASET_REVIEWS = 500
+MAX_ANALYSIS_REVIEWS = 150
+MAX_DISCOVERY_REVIEWS = 150
 AI_MAX_TOKENS = 2000
-AI_BATCH_SIZE = 5
+AI_BATCH_SIZE = 10
 ```
 
 Use a real OpenRouter key that starts with `sk-or-v1-`. Do not paste a Google Gemini `AIza...` key. Do not wrap the key in extra quotes inside the value. After saving secrets, click **Test OpenRouter Connection**. "API KEY Configured" only means a value exists; HTTP 401 means OpenRouter rejected that credential.

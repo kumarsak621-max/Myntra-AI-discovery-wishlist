@@ -72,11 +72,12 @@ def init_db() -> None:
     quarantine_non_myntra_records()
     db = SessionLocal()
     try:
+        from app.models import Review
         from app.pipeline.dataset import enforce_review_limit
-        from config.settings import get_settings as _settings
+        from config.settings import storage_review_limit
 
-        if _settings().prune_excess_reviews:
-            enforce_review_limit(db)
+        if db.query(Review).count() > storage_review_limit():
+            enforce_review_limit(db, prune=True)
     finally:
         db.close()
     ensure_pending_analysis_rows()
@@ -284,13 +285,17 @@ def get_database_diagnostics(db: Session | None = None) -> dict[str, Any]:
             last_error = redact_secrets(str(last_fail_row[0]))
         settings = get_settings()
         path = sqlite_path()
-        from app.pipeline.dataset import analysis_dataset_stats
-        from config.settings import clamp_max_dataset_reviews
+        from app.pipeline.dataset import analysis_dataset_stats, dataset_integrity
+        from config.settings import analysis_review_limit, storage_review_limit
 
         stats = analysis_dataset_stats(session)
+        integrity = dataset_integrity(session)
+        storage_cap = storage_review_limit(settings)
+        sample_cap = analysis_review_limit(settings)
+        total_stored = all_q.count()
         return {
             "database_path": str(path) if path else "",
-            "total_reviews": all_q.count(),
+            "total_reviews": total_stored,
             "myntra_reviews": myntra_q.count(),
             "available_reviews": stats.get("available_reviews") or myntra_q.count(),
             "selected_reviews": stats.get("selected_reviews") or 0,
@@ -298,12 +303,24 @@ def get_database_diagnostics(db: Session | None = None) -> dict[str, Any]:
             "apple_reviews": apple,
             "apple_app_store_reviews": apple,
             "last_30_day_reviews": window_q.count(),
-            "pending_reviews": stats.get("pending_reviews") or 0,
-            "analyzed_reviews": stats.get("analyzed_reviews") or 0,
-            "failed_reviews": stats.get("failed_reviews") or 0,
-            "max_dataset_reviews": clamp_max_dataset_reviews(settings.max_dataset_reviews),
-            "max_analysis_reviews": stats.get("max_analysis_reviews")
-            or clamp_max_dataset_reviews(settings.max_analysis_reviews),
+            "pending_reviews": stats.get("pending_reviews") if stats.get("pending_reviews") is not None else pending,
+            "analyzed_reviews": stats.get("analyzed_reviews") if stats.get("analyzed_reviews") is not None else analyzed,
+            "failed_reviews": stats.get("failed_reviews") if stats.get("failed_reviews") is not None else failed,
+            "sample_analyzed": stats.get("sample_analyzed") or 0,
+            "sample_pending": stats.get("sample_pending") or 0,
+            "sample_failed": stats.get("sample_failed") or 0,
+            "max_dataset_reviews": storage_cap,
+            "max_total_reviews": storage_cap,
+            "max_analysis_reviews": sample_cap,
+            "max_discovery_reviews": sample_cap,
+            "google_play_selected": stats.get("google_play_selected") or 0,
+            "apple_selected": stats.get("apple_selected") or 0,
+            "analysis_batch_size": stats.get("batch_size") or 10,
+            "analysis_batch_total": stats.get("batch_total") or 0,
+            "dataset_limit_reached": total_stored >= storage_cap,
+            "duplicate_source_ids": integrity.get("duplicate_source_ids") or 0,
+            "orphaned_analysis": integrity.get("orphaned_analysis") or 0,
+            "orphaned_evidence_ids": integrity.get("orphaned_evidence_ids") or 0,
             "themes": session.query(Theme).count(),
             "segments": session.query(Segment).count(),
             "opportunities": session.query(Opportunity).count(),
@@ -373,14 +390,21 @@ def get_ai_diagnostics(db: Session | None = None) -> dict[str, Any]:
             "failed_reviews": base.get("failed_reviews") or 0,
             "available_reviews": base.get("available_reviews") or base.get("myntra_reviews") or 0,
             "selected_reviews": base.get("selected_reviews") or 0,
-            "max_analysis_reviews": base.get("max_analysis_reviews") or 300,
+            "max_analysis_reviews": base.get("max_analysis_reviews") or 150,
+            "max_dataset_reviews": base.get("max_dataset_reviews") or 500,
+            "max_discovery_reviews": base.get("max_discovery_reviews") or 150,
+            "max_total_reviews": base.get("max_total_reviews") or 500,
+            "dataset_limit_reached": bool(base.get("dataset_limit_reached")),
+            "google_play_selected": base.get("google_play_selected") or 0,
+            "apple_selected": base.get("apple_selected") or 0,
+            "analysis_batch_size": base.get("analysis_batch_size") or 10,
+            "analysis_batch_total": base.get("analysis_batch_total") or 0,
             "last_successful_analysis": base.get("last_successful_analysis_at"),
             "last_failed_analysis": last_fail_at.isoformat() if last_fail_at else None,
             "last_error": last_error or None,
             "last_http_status": last_http,
             "myntra_reviews": base.get("myntra_reviews") or 0,
             "total_reviews": base.get("total_reviews") or 0,
-            "max_dataset_reviews": base.get("max_dataset_reviews") or 300,
             "last_30_day_reviews": base.get("last_30_day_reviews") or 0,
         }
     finally:

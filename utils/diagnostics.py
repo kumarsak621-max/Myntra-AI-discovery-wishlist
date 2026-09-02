@@ -62,7 +62,10 @@ def run_diagnostics() -> dict:
             "database": {
                 "path": str(sqlite_path() or ""),
                 "total_reviews": base.get("total_reviews") or 0,
-                "max_dataset_reviews": base.get("max_dataset_reviews") or 300,
+                "max_dataset_reviews": base.get("max_dataset_reviews") or 500,
+                "max_total_reviews": base.get("max_total_reviews") or 500,
+                "max_analysis_reviews": base.get("max_analysis_reviews") or 150,
+                "dataset_limit_reached": bool(base.get("dataset_limit_reached")),
                 "google_play_reviews": base.get("google_play_reviews") or 0,
                 "apple_reviews": base.get("apple_reviews") or 0,
                 "last_30_day_reviews": base.get("last_30_day_reviews") or 0,
@@ -114,8 +117,10 @@ def print_report(report: dict) -> None:
     print("--------")
     print("Path:", db["path"])
     print("Total reviews:", db["total_reviews"])
+    print("Max total:", db.get("max_total_reviews") or 500)
+    print("Limit reached:", db.get("dataset_limit_reached"))
     print("Available:", db.get("available_reviews") or db["total_reviews"])
-    print("Selected:", db.get("selected_reviews") or "n/a")
+    print("AI sample:", db.get("selected_reviews") or "n/a")
     print("Google reviews:", db["google_play_reviews"])
     print("Apple reviews:", db["apple_reviews"])
     print("Last 30 days:", db["last_30_day_reviews"])

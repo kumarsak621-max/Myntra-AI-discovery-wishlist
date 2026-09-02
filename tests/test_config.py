@@ -77,9 +77,13 @@ def test_get_ai_config_never_returns_key():
     assert cfg["max_tokens"] == 2000 or 64 <= int(cfg["max_tokens"]) <= 2000
     assert int(cfg["max_tokens"]) != 65535
     assert 1 <= int(cfg["batch_size"]) <= 10
-    assert int(cfg["max_dataset_reviews"]) == 300 or int(cfg["max_dataset_reviews"]) >= 1
-    assert int(cfg.get("max_analysis_reviews") or 300) >= 1
+    assert int(cfg["max_dataset_reviews"]) == 500
+    assert int(cfg["max_total_reviews"]) == 500
+    assert int(cfg.get("max_analysis_reviews") or 150) == 150
+    assert int(cfg.get("max_discovery_reviews") or 150) == 150
     assert int(cfg["max_dataset_reviews"]) != 1300
+    assert int(cfg["batch_size"]) == 10
+    assert int(cfg["max_tokens"]) != 65535
     assert "openrouter_api_key" not in cfg
     assert "api_key" not in cfg
     dumped = str(cfg)
@@ -102,13 +106,35 @@ def test_get_ai_config_never_returns_key():
         assert "Gemini" not in cfg["missing_key_message"]
 
 
-def test_clamp_max_dataset_reviews_defaults_to_300():
-    from config.settings import DEFAULT_MAX_DATASET_REVIEWS, clamp_max_dataset_reviews, Settings
+def test_storage_and_analysis_caps_are_distinct():
+    from config.settings import (
+        DEFAULT_MAX_ANALYSIS_REVIEWS,
+        DEFAULT_MAX_TOTAL_REVIEWS,
+        clamp_max_analysis_reviews,
+        clamp_max_dataset_reviews,
+        Settings,
+    )
 
-    assert DEFAULT_MAX_DATASET_REVIEWS == 300
-    assert clamp_max_dataset_reviews(None) == 300
-    assert clamp_max_dataset_reviews("300") == 300
-    assert Settings(max_dataset_reviews=300).max_dataset_reviews == 300
+    assert DEFAULT_MAX_TOTAL_REVIEWS == 500
+    assert DEFAULT_MAX_ANALYSIS_REVIEWS == 150
+    assert clamp_max_dataset_reviews(None) == 500
+    assert clamp_max_dataset_reviews("500") == 500
+    assert clamp_max_dataset_reviews(1300) == 500
+    assert clamp_max_analysis_reviews(None) == 150
+    assert clamp_max_analysis_reviews(500, 500) == 500
+    assert clamp_max_analysis_reviews(150, 500) == 150
+    settings = Settings(
+        max_total_reviews=500,
+        max_dataset_reviews=500,
+        max_analysis_reviews=150,
+        max_discovery_reviews=150,
+    )
+    assert settings.max_total_reviews == 500
+    assert settings.max_dataset_reviews == 500
+    assert settings.max_analysis_reviews == 150
+    assert settings.max_discovery_reviews == 150
+    assert settings.google_play_max_reviews == 250
+    assert settings.apple_max_reviews == 250
     from config.settings import clamp_max_tokens
 
     assert clamp_max_tokens(65535) == 2000

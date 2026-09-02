@@ -49,10 +49,11 @@ from app.pipeline.quantification import (
 )
 from app.pipeline.report import build_report, evidence_cards
 from config.settings import (
-    clamp_max_dataset_reviews,
+    analysis_review_limit,
     get_ai_config,
     get_settings,
     reload_settings,
+    storage_review_limit,
 )
 from dashboard.charts import bar_chart, donut_chart, heatmap_impact_frequency, scatter_chart, trend_frame
 from dashboard.chat import ask_product_assistant
@@ -62,7 +63,7 @@ from dashboard.questions import DISCOVERY_QUESTIONS, answer_discovery_questions
 LOGGER = logging.getLogger("myntra.discovery")
 
 EMPTY = "No real reviews have been collected yet."
-NEAR_REALTIME = "Near-real-time — refreshed from public sources"
+NEAR_REALTIME = "Near-real-time — refreshed from the public source"
 AUTO_REFRESH_INTERVAL = timedelta(minutes=5)
 AUTO_REFRESH_SECONDS = int(AUTO_REFRESH_INTERVAL.total_seconds())
 INSUFFICIENT_ROOT = "Insufficient real evidence for this analysis."
@@ -112,7 +113,11 @@ def _openrouter_error(exc: Exception | str) -> str:
 
 
 def _dataset_limit() -> int:
-    return clamp_max_dataset_reviews(get_settings().max_dataset_reviews)
+    return storage_review_limit(get_settings())
+
+
+def _analysis_limit() -> int:
+    return analysis_review_limit(get_settings())
 
 
 def _period_since():
@@ -434,7 +439,11 @@ def render() -> None:
         period = st.selectbox("Period", ["Last 30 Days", "All Time"], index=0)
         st.session_state["period"] = period
         if st.button("🔄 Refresh Latest Reviews"):
-            _run_collect(["google_play", "apple_app_store"], analyze=False, mode="latest")
+            _run_collect(
+                ["google_play", "apple_app_store"],
+                analyze=bool(get_settings().has_ai_credentials),
+                mode="latest",
+            )
         st.session_state["analyze_on_collect"] = False
         diag_side = get_database_diagnostics()
         freshness_side = _seconds_since_last_collection()
@@ -442,16 +451,36 @@ def render() -> None:
         if freshness_side is not None:
             last_checked = humanize_ago(utcnow() - timedelta(seconds=freshness_side))
         st.caption(f"Last checked: {last_checked}")
-        st.caption(f"Reviews: {diag_side.get('total_reviews') or 0}")
-        st.caption(f"Analyzed: {diag_side.get('analyzed_reviews') or 0}")
+        st.caption(f"Stored reviews: {diag_side.get('total_reviews') or 0} / {diag_side.get('max_total_reviews') or _dataset_limit()}")
+        st.caption(f"AI analyzed: {diag_side.get('analyzed_reviews') or 0} / {diag_side.get('max_analysis_reviews') or _analysis_limit()}")
         st.caption(NEAR_REALTIME)
         with st.expander("More"):
             if st.button("Analyze pending"):
                 _run_analyze()
             if st.button("Retry failed analysis"):
                 _run_analyze(only_failed=True)
-            st.caption(f"Dataset limit: {_dataset_limit()} (maximum)")
-            st.caption("API key is never displayed.")
+            if st.button("Enforce 500 Review Limit"):
+                from app.pipeline.dataset import enforce_review_limit
+
+                prune_db = _db()
+                try:
+                    result = enforce_review_limit(prune_db, prune=True)
+                    st.session_state["prune_result"] = result
+                    _load_bundle.clear()
+                finally:
+                    prune_db.close()
+                st.rerun()
+            prune_result = st.session_state.get("prune_result")
+            if prune_result:
+                st.caption(
+                    f"Last prune: kept {prune_result.get('kept')} / {prune_result.get('max_reviews')}, "
+                    f"deleted {prune_result.get('deleted')}."
+                )
+            st.caption(
+                f"Storage cap: {_dataset_limit()} combined. "
+                f"AI sample: {_analysis_limit()}. "
+                "API key is never displayed."
+            )
 
     since = _period_since()
     cache_token = f"{_cache_token()}:{source}:{period}"
@@ -536,7 +565,7 @@ def _actions(ai_ok: bool) -> None:
         if st.button("🔄 Refresh latest reviews"):
             _run_collect(
                 ["google_play", "apple_app_store"],
-                analyze=bool(st.session_state.get("analyze_on_collect")),
+                analyze=bool(get_settings().has_ai_credentials),
                 mode="latest",
             )
     with c:
@@ -554,25 +583,36 @@ def _actions(ai_ok: bool) -> None:
 
 def _kpis(diag: dict, metrics: dict, opps: list, themes: list, period: str) -> None:
     top_score = opps[0]["score"] if opps else 0
-    available = int(diag.get("available_reviews") or diag.get("myntra_reviews") or diag.get("total_reviews") or 0)
-    selected = int(diag.get("selected_reviews") or min(available, int(diag.get("max_analysis_reviews") or 300)))
+    storage_cap = int(diag.get("max_total_reviews") or diag.get("max_dataset_reviews") or _dataset_limit())
+    sample_cap = int(diag.get("max_analysis_reviews") or _analysis_limit())
+    stored = int(diag.get("total_reviews") or 0)
+    google = int(diag.get("google_play_reviews") or 0)
+    apple = int(diag.get("apple_reviews") or 0)
     analyzed = int(diag.get("analyzed_reviews") or 0)
+    pending = int(diag.get("pending_reviews") or 0)
+    failed = int(diag.get("failed_reviews") or 0)
+    selected = int(diag.get("selected_reviews") or 0)
+    st.markdown("**REVIEW DATASET**")
     cols = st.columns(5)
-    cols[0].metric("Reviews available", available)
-    cols[1].metric("Selected for analysis", selected)
-    cols[2].metric("Analyzed", analyzed)
-    cols[3].metric("Pending", diag.get("pending_reviews") or 0)
-    cols[4].metric("Failed", diag.get("failed_reviews") or 0)
+    cols[0].metric("Total reviews", f"{stored} / {storage_cap}")
+    cols[1].metric("Google Play", google)
+    cols[2].metric("Apple App Store", apple)
+    cols[3].metric("AI analyzed", analyzed)
+    cols[4].metric("Pending", pending)
     cols2 = st.columns(5)
-    cols2[0].metric("Google Play", diag.get("google_play_reviews") or 0)
-    cols2[1].metric("Apple App Store", diag.get("apple_reviews") or 0)
+    cols2[0].metric("Failed", failed)
+    cols2[1].metric("AI analysis sample", f"{selected} / {sample_cap}")
     cols2[2].metric("Last 30 days", diag.get("last_30_day_reviews") or 0)
     cols2[3].metric("Wishlist-related", metrics.get("wishlist_signals") or 0)
     cols2[4].metric("Unique themes / top score", f"{len(themes)} / {top_score}")
+    if diag.get("dataset_limit_reached"):
+        st.info(f"Dataset limit reached: {stored} stored reviews (maximum {storage_cap}).")
     st.caption(
-        f"Analysis based on {analyzed} public reviews"
-        f"{f' (selected {selected} of {available} stored)' if available else ''}. "
+        f"Storage holds {stored} real public reviews (maximum {storage_cap}). "
+        f"AI analyzes a sample of {selected} (maximum {sample_cap}), not the full stored set. "
         f"Period filter: {period}. This sample is not the entire Myntra customer base. "
+        "Public reviews do not expose Myntra's actual wishlist-to-purchase conversion events. "
+        "Conversion insights are evidence-based opportunity indicators, not Myntra's actual conversion rate. "
         "Counts come from the database, not the LLM."
     )
 
@@ -597,22 +637,51 @@ def _live_status(data: dict, diag: dict) -> None:
     b.metric("Last checked", humanize_ago(checked))
     c.metric("Pending analysis", diag.get("pending_reviews") or 0)
     d.metric("Failed analysis", diag.get("failed_reviews") or 0)
+    stored = int(diag.get("total_reviews") or 0)
+    storage_cap = int(diag.get("max_total_reviews") or _dataset_limit())
+    sample_cap = int(diag.get("max_analysis_reviews") or _analysis_limit())
     selected = int(diag.get("selected_reviews") or 0)
     analyzed = int(diag.get("analyzed_reviews") or 0)
     pending = int(diag.get("pending_reviews") or 0)
     failed = int(diag.get("failed_reviews") or 0)
+    sample_analyzed = int(diag.get("sample_analyzed") or 0)
+    st.markdown("**DATASET LIMIT**")
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Maximum total reviews", storage_cap)
+    d2.metric("Current stored reviews", stored)
+    d3.metric("Google Play", diag.get("google_play_reviews") or 0)
+    d4.metric("Apple App Store", diag.get("apple_reviews") or 0)
+    d5, d6, d7, d8 = st.columns(4)
+    d5.metric("Available analysis sample", f"{selected} / {sample_cap}")
+    d6.metric("AI analyzed", analyzed)
+    d7.metric("Pending", pending)
+    d8.metric("Failed", failed)
+    if diag.get("dataset_limit_reached"):
+        st.warning(f"Storage limit reached ({stored} / {storage_cap}). New collection will prune the oldest excess reviews.")
+    batch_size = int(diag.get("analysis_batch_size") or get_ai_config().get("batch_size") or 10)
+    batch_total = int(diag.get("analysis_batch_total") or ((selected + batch_size - 1) // batch_size if selected else 0))
     st.markdown("**AI ANALYSIS PROGRESS**")
     p1, p2, p3, p4 = st.columns(4)
-    p1.metric("Reviews selected", selected)
-    p2.metric("Analyzed", analyzed)
-    p3.metric("Pending", pending)
-    p4.metric("Failed", failed)
-    percent = int(round(100 * analyzed / selected)) if selected else 0
-    st.progress(min(100, max(0, percent)) / 100, text=f"Progress: {percent}%")
+    p1.metric("Sample selected", f"{selected} / {sample_cap}")
+    p2.metric("Batch size", batch_size)
+    p3.metric("Total batches", batch_total)
+    p4.metric("Sample analyzed", f"{sample_analyzed} / {selected or sample_cap}")
     last = st.session_state.get("analysis_progress") or {}
+    completed_batches = int(last.get("batch_index") or 0)
+    failed_batches = int((st.session_state.get("last_analysis") or {}).get("failed_batches") or 0)
+    b1, b2, b3 = st.columns(3)
+    b1.metric("Completed batches", completed_batches)
+    b2.metric("Failed batches", failed_batches)
+    b3.metric("Failed reviews", failed)
+    percent = int(round(100 * sample_analyzed / selected)) if selected else 0
+    st.progress(min(100, max(0, percent)) / 100, text=f"Progress: {percent}%")
     if last.get("batch_index") and last.get("batch_total"):
         st.caption(f"Current batch: {last.get('batch_index')} / {last.get('batch_total')}")
-    st.caption("Progress updates after each completed analysis batch. Not a live in-app event stream.")
+    st.caption(
+        "AI analyzes the selected sample in batches of 10. "
+        "Pending stored reviews outside the sample are not treated as analyzed. "
+        "Progress updates after each completed batch."
+    )
     if diag.get("last_analysis_error"):
         st.error(diag.get("last_analysis_error"))
     daily = data.get("daily") or []
@@ -882,7 +951,8 @@ def _themes(data: dict, analyzed: int) -> None:
 
 def _segments(data: dict, analyzed: int) -> None:
     st.markdown('<div class="section-h">10. USER SEGMENTS</div>', unsafe_allow_html=True)
-    st.info("Age is not directly observable from public reviews. Demographic information is not available from the public review dataset.")
+    st.caption("Evidence-based behavioral segments")
+    st.info("Age is not directly observable from public reviews. Demographic information is not available from the public review dataset. Do not treat these groups as age bands.")
     segs = data["segments"] or [
         {"name": r["label"], "review_count": r["count"], "basis": "Evidence-based inferred segment", "evidence_ids": r.get("review_ids") or []}
         for r in (data.get("segment_tax") or [])
@@ -1292,7 +1362,10 @@ def _limitations() -> None:
         """
         <div class="limit-card">
         Public reviews are not the complete Myntra customer base.
-        Public reviews do not directly expose wishlist or purchase events.
+        The database stores at most 500 real public reviews.
+        AI analysis uses a sample of at most 150 of those reviews.
+        Public reviews do not expose Myntra's actual wishlist-to-purchase conversion events.
+        Conversion insights are evidence-based opportunity indicators, not Myntra's actual conversion rate.
         Demographics are generally unavailable unless provided by a separate survey dataset.
         Behavioral segments are inferred from textual evidence.
         Near-real-time means periodic refresh from public sources.
@@ -1365,8 +1438,23 @@ def _run_full_discovery(ai_ok: bool) -> None:
     try:
         with st.status("Full discovery pipeline", expanded=True) as box:
             stored = get_review_count(db, myntra_only=True)
-            if stored > 0:
-                box.write(f"Collection skipped — {stored} stored Myntra-valid reviews already in the database")
+            from app.pipeline.dataset import analysis_dataset_stats, enforce_review_limit
+
+            if stored > _dataset_limit():
+                prune = enforce_review_limit(db, prune=True)
+                box.write(
+                    f"Pruned storage to {prune.get('kept')} / {prune.get('max_reviews')} "
+                    f"(deleted {prune.get('deleted')} excess reviews)"
+                )
+                stored = get_review_count(db, myntra_only=True)
+            stats = analysis_dataset_stats(db)
+            storage_cap = int(stats.get("max_total_reviews") or _dataset_limit())
+            if stored >= storage_cap:
+                box.write(
+                    f"Collection skipped — {stored} stored Myntra-valid reviews already at the "
+                    f"{storage_cap} combined limit. AI sample: {stats.get('selected_reviews')} / "
+                    f"{stats.get('max_analysis_reviews')}."
+                )
                 steps["play"] = steps["apple"] = steps["save"] = "done"
             else:
                 engine = CollectionEngine(db)

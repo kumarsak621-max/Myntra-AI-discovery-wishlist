@@ -75,16 +75,62 @@ def clamp_batch_size(value) -> int:
     return max(1, min(10, number))
 
 
-DEFAULT_MAX_DATASET_REVIEWS = 300
+DEFAULT_MAX_TOTAL_REVIEWS = 500
+DEFAULT_MAX_ANALYSIS_REVIEWS = 150
+DEFAULT_MAX_DATASET_REVIEWS = DEFAULT_MAX_TOTAL_REVIEWS
 
 
-def clamp_max_dataset_reviews(value) -> int:
-    """Active real-review cap. 300 is a maximum, not a target to fabricate toward."""
+def clamp_max_total_reviews(value) -> int:
+    """Hard combined storage cap (Google Play + Apple). Never above 500."""
     try:
         number = int(value)
     except (TypeError, ValueError):
-        number = DEFAULT_MAX_DATASET_REVIEWS
-    return max(1, min(10_000, number))
+        number = DEFAULT_MAX_TOTAL_REVIEWS
+    return max(1, min(DEFAULT_MAX_TOTAL_REVIEWS, number))
+
+
+def clamp_max_dataset_reviews(value) -> int:
+    """Alias for the storage cap. 500 is a maximum, not a target to fabricate toward."""
+    return clamp_max_total_reviews(value)
+
+
+def clamp_max_analysis_reviews(value, storage_cap: int | None = None) -> int:
+    """AI/discovery sample size. Never larger than the stored-review cap."""
+    cap = storage_cap if storage_cap is not None else DEFAULT_MAX_TOTAL_REVIEWS
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = DEFAULT_MAX_ANALYSIS_REVIEWS
+    return max(1, min(int(cap), number))
+
+
+def storage_review_limit(settings=None) -> int:
+    """MAX_TOTAL_REVIEWS / MAX_DATASET_REVIEWS — stored production reviews."""
+    if settings is None:
+        settings = get_settings()
+    return clamp_max_total_reviews(
+        getattr(settings, "max_total_reviews", None)
+        or getattr(settings, "max_dataset_reviews", None)
+        or DEFAULT_MAX_TOTAL_REVIEWS
+    )
+
+
+def analysis_review_limit(settings=None) -> int:
+    """MAX_ANALYSIS_REVIEWS / MAX_DISCOVERY_REVIEWS — AI sample, not storage."""
+    if settings is None:
+        settings = get_settings()
+    storage = storage_review_limit(settings)
+    return clamp_max_analysis_reviews(
+        getattr(settings, "max_analysis_reviews", None)
+        or getattr(settings, "max_discovery_reviews", None)
+        or DEFAULT_MAX_ANALYSIS_REVIEWS,
+        storage,
+    )
+
+
+def discovery_review_limit(settings=None) -> int:
+    """Dashboard/AI sample. Distinct from the 500-review storage cap."""
+    return analysis_review_limit(settings)
 
 
 def openrouter_key_prefix_status(key: str) -> str:
@@ -122,7 +168,7 @@ class Settings(BaseSettings):
     ai_http_timeout_seconds: float = 60.0
 
     google_play_app_id: str = OFFICIAL_GOOGLE_PLAY_APP_ID
-    google_play_max_reviews: int = 5000
+    google_play_max_reviews: int = 250
     google_play_batch_size: int = 100
     google_play_language: str = "en"
     google_play_country: str = "in"
@@ -130,25 +176,27 @@ class Settings(BaseSettings):
     apple_app_id: str = OFFICIAL_APPLE_APP_ID
     apple_primary_region: str = "in"
     apple_fallback_region: str = "us"
-    apple_max_reviews: int = 5000
+    apple_max_reviews: int = 250
 
     database_url: str = "sqlite:///./myntra_discovery.db"
 
     collection_rate_limit_seconds: float = 1.0
     collection_retry_attempts: int = 3
     collection_window_days: int = 30
-    google_play_window_safety_limit: int = 800
-    apple_window_safety_limit: int = 500
+    google_play_window_safety_limit: int = 250
+    apple_window_safety_limit: int = 250
     refresh_safety_limit: int = 150
-    max_dataset_reviews: int = DEFAULT_MAX_DATASET_REVIEWS
-    max_analysis_reviews: int = DEFAULT_MAX_DATASET_REVIEWS
-    prune_excess_reviews: bool = False
+    max_dataset_reviews: int = DEFAULT_MAX_TOTAL_REVIEWS
+    max_total_reviews: int = DEFAULT_MAX_TOTAL_REVIEWS
+    max_analysis_reviews: int = DEFAULT_MAX_ANALYSIS_REVIEWS
+    max_discovery_reviews: int = DEFAULT_MAX_ANALYSIS_REVIEWS
+    prune_excess_reviews: bool = True
     expected_app_name: str = OFFICIAL_GOOGLE_PLAY_APP_NAME
     expected_apple_app_name: str = OFFICIAL_APPLE_APP_NAME
 
     ai_max_review_chars: int = 4000
     ai_rate_limit_seconds: float = 0.4
-    ai_analysis_batch_size: int = 300
+    ai_analysis_batch_size: int = DEFAULT_MAX_ANALYSIS_REVIEWS
     ai_request_batch_size: int = 10
     ai_batch_size: int | None = None
     analysis_batch_size: int | None = None
@@ -177,9 +225,18 @@ class Settings(BaseSettings):
         self.ai_request_batch_size = clamp_batch_size(batch)
         self.ai_batch_size = self.ai_request_batch_size
         self.analysis_batch_size = self.ai_request_batch_size
-        self.max_dataset_reviews = clamp_max_dataset_reviews(self.max_dataset_reviews)
-        self.max_analysis_reviews = clamp_max_dataset_reviews(
-            self.max_analysis_reviews or self.max_dataset_reviews
+        storage = clamp_max_total_reviews(self.max_total_reviews or self.max_dataset_reviews)
+        self.max_total_reviews = storage
+        self.max_dataset_reviews = storage
+        analysis = clamp_max_analysis_reviews(self.max_analysis_reviews, storage)
+        discovery = clamp_max_analysis_reviews(
+            self.max_discovery_reviews if self.max_discovery_reviews is not None else analysis,
+            storage,
+        )
+        self.max_analysis_reviews = analysis
+        self.max_discovery_reviews = discovery
+        self.ai_analysis_batch_size = clamp_max_analysis_reviews(
+            self.ai_analysis_batch_size or analysis, storage
         )
         return self
 
@@ -308,17 +365,28 @@ def get_settings() -> Settings:
         settings.ai_batch_size = clamp_batch_size(secret_batch)
         settings.ai_request_batch_size = settings.ai_batch_size
         settings.analysis_batch_size = settings.ai_batch_size
-    secret_limit = _streamlit_secret("MAX_DATASET_REVIEWS")
-    if secret_limit:
-        settings.max_dataset_reviews = clamp_max_dataset_reviews(secret_limit)
+    secret_total = _streamlit_secret("MAX_TOTAL_REVIEWS") or _streamlit_secret("MAX_DATASET_REVIEWS")
+    if secret_total:
+        storage = clamp_max_total_reviews(secret_total)
+        settings.max_total_reviews = storage
+        settings.max_dataset_reviews = storage
     else:
-        settings.max_dataset_reviews = clamp_max_dataset_reviews(settings.max_dataset_reviews)
-    secret_analysis = _streamlit_secret("MAX_ANALYSIS_REVIEWS")
+        storage = clamp_max_total_reviews(
+            settings.max_total_reviews or settings.max_dataset_reviews
+        )
+        settings.max_total_reviews = storage
+        settings.max_dataset_reviews = storage
+    secret_analysis = _streamlit_secret("MAX_ANALYSIS_REVIEWS") or _streamlit_secret("MAX_DISCOVERY_REVIEWS")
     if secret_analysis:
-        settings.max_analysis_reviews = clamp_max_dataset_reviews(secret_analysis)
+        sample = clamp_max_analysis_reviews(secret_analysis, storage)
+        settings.max_analysis_reviews = sample
+        settings.max_discovery_reviews = sample
     else:
-        settings.max_analysis_reviews = clamp_max_dataset_reviews(
-            settings.max_analysis_reviews or settings.max_dataset_reviews
+        sample = clamp_max_analysis_reviews(settings.max_analysis_reviews, storage)
+        settings.max_analysis_reviews = sample
+        settings.max_discovery_reviews = clamp_max_analysis_reviews(
+            settings.max_discovery_reviews if settings.max_discovery_reviews is not None else sample,
+            storage,
         )
     settings.ai_provider = "openrouter"
     return settings
@@ -355,9 +423,13 @@ def get_ai_config() -> dict:
             or settings.ai_request_batch_size
             or 10
         ),
-        "max_dataset_reviews": clamp_max_dataset_reviews(settings.max_dataset_reviews),
-        "max_analysis_reviews": clamp_max_dataset_reviews(
-            settings.max_analysis_reviews or settings.max_dataset_reviews
+        "max_dataset_reviews": clamp_max_total_reviews(settings.max_dataset_reviews),
+        "max_total_reviews": clamp_max_total_reviews(settings.max_total_reviews),
+        "max_analysis_reviews": clamp_max_analysis_reviews(
+            settings.max_analysis_reviews, settings.max_total_reviews
+        ),
+        "max_discovery_reviews": clamp_max_analysis_reviews(
+            settings.max_discovery_reviews, settings.max_total_reviews
         ),
         "prune_excess_reviews": bool(settings.prune_excess_reviews),
         "missing_key_message": (
