@@ -128,6 +128,27 @@ def test_last_30_days_uses_review_date_not_collected_at(db):
     assert {r.source_review_id for r in window} == {"new"}
 
 
+def test_select_analysis_does_not_delete_stored_reviews(db):
+    from app.pipeline.dataset import analysis_dataset_stats, enforce_review_limit, select_analysis_reviews
+
+    for day in range(1, 6):
+        _add(db, source="google_play", source_id=f"keep-{day}", day=day)
+    db.commit()
+    before = db.query(Review).count()
+    selected = select_analysis_reviews(db, max_reviews=3)
+    after_select = db.query(Review).count()
+    assert before == 5
+    assert after_select == 5
+    assert len(selected) == 3
+    untouched = enforce_review_limit(db)
+    assert untouched["deleted"] == 0
+    assert db.query(Review).count() == 5
+    stats = analysis_dataset_stats(db, max_reviews=3)
+    assert stats["available_reviews"] == 5
+    assert stats["selected_reviews"] == 3
+    assert stats["pending_reviews"] == 3
+
+
 def test_select_keep_ids_prefers_half_split():
     class _R:
         def __init__(self, id, source, day):

@@ -30,7 +30,11 @@ def run_analysis_pipeline(
         only_failed=only_failed,
         include_failed=include_failed,
     )
-    if result.analyzed == 0:
+    from app.pipeline.dataset import analysis_dataset_stats
+
+    stats = analysis_dataset_stats(db)
+    stored_analyzed = int(stats.get("analyzed_reviews") or 0)
+    if result.analyzed == 0 and stored_analyzed == 0:
         message = (
             result.last_error
             or "Discovery insights could not be generated because AI analysis failed."
@@ -54,6 +58,7 @@ def run_analysis_pipeline(
                 "status": "complete",
                 "analyzed": result.analyzed,
                 "failed": result.failed,
+                "analyzed_total": stored_analyzed,
                 "message": result.last_error,
             }
         )

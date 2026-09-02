@@ -55,6 +55,52 @@ def _usable_reviews(db: Session) -> list[Review]:
     return myntra if myntra else rows
 
 
+def select_analysis_reviews(db: Session, max_reviews: int | None = None) -> list[Review]:
+    """Choose up to MAX_ANALYSIS_REVIEWS real reviews. Never deletes storage rows."""
+    settings = get_settings()
+    limit = clamp_max_dataset_reviews(
+        max_reviews
+        if max_reviews is not None
+        else getattr(settings, "max_analysis_reviews", None) or getattr(settings, "max_dataset_reviews", 300)
+    )
+    usable = _usable_reviews(db)
+    keep_ids = select_keep_ids(usable, limit)
+    selected = [row for row in usable if int(row.id) in keep_ids]
+    return _newest_first(selected)
+
+
+def analysis_dataset_stats(db: Session, max_reviews: int | None = None) -> dict[str, int]:
+    """Counts for the analysis dataset (selected subset), not the whole customer base."""
+    settings = get_settings()
+    cap = clamp_max_dataset_reviews(
+        max_reviews
+        if max_reviews is not None
+        else getattr(settings, "max_analysis_reviews", None) or getattr(settings, "max_dataset_reviews", 300)
+    )
+    available = _usable_reviews(db)
+    selected = select_analysis_reviews(db, cap)
+    analyzed = 0
+    pending = 0
+    failed = 0
+    for review in selected:
+        analysis = review.analysis
+        status = getattr(analysis, "status", "") if analysis is not None else ""
+        if analysis is not None and status == "analyzed" and analysis.is_valid_json:
+            analyzed += 1
+        elif analysis is not None and status == "failed":
+            failed += 1
+        else:
+            pending += 1
+    return {
+        "available_reviews": len(available),
+        "selected_reviews": len(selected),
+        "analyzed_reviews": analyzed,
+        "pending_reviews": pending,
+        "failed_reviews": failed,
+        "max_analysis_reviews": cap,
+    }
+
+
 def select_keep_ids(reviews: list[Review], max_reviews: int) -> set[int]:
     """Keep the newest real reviews, preferring a 50/50 source split when both exist."""
     if max_reviews <= 0:
@@ -128,16 +174,30 @@ def _refresh_source_counts(db: Session) -> None:
 def enforce_review_limit(
     db: Session,
     max_reviews: int | None = None,
+    *,
+    prune: bool | None = None,
 ) -> dict[str, int]:
-    """Keep at most `max_reviews` newest real reviews. Delete excess and their analysis.
+    """Optionally delete excess stored reviews. Off by default.
 
-    Does nothing when the usable corpus is already within the limit.
-    Never inserts or fabricates reviews.
+    Callers that pass an explicit max_reviews (tests / admin prune) still delete.
+    Collection and analysis must not pass max_reviews unless PRUNE_EXCESS_REVIEWS is on.
     """
     settings = get_settings()
-    limit = clamp_max_dataset_reviews(
-        max_reviews if max_reviews is not None else getattr(settings, "max_dataset_reviews", 300)
-    )
+    enabled = bool(settings.prune_excess_reviews) if prune is None else bool(prune)
+    if max_reviews is None and not enabled:
+        usable = _usable_reviews(db)
+        cap = clamp_max_dataset_reviews(getattr(settings, "max_dataset_reviews", 300))
+        return {
+            "max_reviews": cap,
+            "before": db.query(Review).count(),
+            "kept": len(usable),
+            "deleted": 0,
+            "analysis_deleted": 0,
+            "pruned": False,
+        }
+    if max_reviews is None:
+        max_reviews = getattr(settings, "max_dataset_reviews", 300)
+    limit = clamp_max_dataset_reviews(max_reviews)
     usable = _usable_reviews(db)
     keep_ids = select_keep_ids(usable, limit)
     all_ids = {int(row[0]) for row in db.query(Review.id).all()}

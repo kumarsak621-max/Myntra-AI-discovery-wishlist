@@ -7,6 +7,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.pipeline.labels import is_placeholder_label, stored_category_text
+
 
 class SourceValidation(BaseModel):
     platform: str
@@ -154,8 +156,8 @@ class ReviewAnalysisSchema(BaseModel):
         cleaned = []
         seen: set[str] = set()
         for item in value:
-            text = " ".join(str(item).split()).strip()
-            if not text:
+            text = stored_category_text(item)
+            if not text or is_placeholder_label(text):
                 continue
             key = text.lower()
             if key in seen:

@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.models import Opportunity, Review, Segment, Theme
+from app.pipeline.labels import merge_category_rows, normalize_category_label
 from app.pipeline.quantification import _loads, problem_rows
 from config.settings import official_ids
 
@@ -65,21 +66,33 @@ def retrieve_evidence(db: Session, question: str, *, limit: int = 8) -> dict[str
 
     q = question.lower()
     problems = [p for p in problem_rows(db, myntra_only=True) if any(t in (p.get("problem") or "").lower() for t in tokens)]
-    themes = [
-        {"name": t.name, "count": t.review_count}
-        for t in db.query(Theme).order_by(Theme.review_count.desc()).all()
-        if any(tok in (t.name or "").lower() for tok in tokens) or "theme" in q
-    ][:8]
-    opportunities = [
-        {"name": o.name, "score": o.score, "count": o.relevant_count}
-        for o in db.query(Opportunity).order_by(Opportunity.rank.asc()).all()
-        if any(tok in (o.name or "").lower() for tok in tokens) or "opportunit" in q
-    ][:8]
-    segments = [
-        {"name": s.name, "count": s.review_count}
-        for s in db.query(Segment).order_by(Segment.review_count.desc()).all()
-        if any(tok in (s.name or "").lower() for tok in tokens) or "segment" in q
-    ][:8]
+    themes = merge_category_rows(
+        [
+            {"name": t.name, "count": t.review_count, "evidence_ids": []}
+            for t in db.query(Theme).order_by(Theme.review_count.desc()).all()
+            if any(tok in normalize_category_label(t.name).lower() for tok in tokens) or "theme" in q
+        ],
+        label_keys=("name", "label"),
+        count_keys=("count", "review_count"),
+    )[:8]
+    opportunities = merge_category_rows(
+        [
+            {"name": o.name, "score": o.score, "count": o.relevant_count}
+            for o in db.query(Opportunity).order_by(Opportunity.rank.asc()).all()
+            if any(tok in normalize_category_label(o.name).lower() for tok in tokens) or "opportunit" in q
+        ],
+        label_keys=("name", "label"),
+        count_keys=("count", "relevant_count"),
+    )[:8]
+    segments = merge_category_rows(
+        [
+            {"name": s.name, "count": s.review_count}
+            for s in db.query(Segment).order_by(Segment.review_count.desc()).all()
+            if any(tok in normalize_category_label(s.name).lower() for tok in tokens) or "segment" in q
+        ],
+        label_keys=("name", "label"),
+        count_keys=("count", "review_count"),
+    )[:8]
     if "opportunit" in q and not opportunities:
         opportunities = [
             {"name": o.name, "score": o.score, "count": o.relevant_count}

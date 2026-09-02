@@ -71,7 +71,7 @@ def clamp_batch_size(value) -> int:
     try:
         number = int(value)
     except (TypeError, ValueError):
-        number = 5
+        number = 10
     return max(1, min(10, number))
 
 
@@ -141,15 +141,19 @@ class Settings(BaseSettings):
     apple_window_safety_limit: int = 500
     refresh_safety_limit: int = 150
     max_dataset_reviews: int = DEFAULT_MAX_DATASET_REVIEWS
+    max_analysis_reviews: int = DEFAULT_MAX_DATASET_REVIEWS
+    prune_excess_reviews: bool = False
     expected_app_name: str = OFFICIAL_GOOGLE_PLAY_APP_NAME
     expected_apple_app_name: str = OFFICIAL_APPLE_APP_NAME
 
     ai_max_review_chars: int = 4000
     ai_rate_limit_seconds: float = 0.4
-    ai_analysis_batch_size: int = 60
-    ai_request_batch_size: int = 5
+    ai_analysis_batch_size: int = 300
+    ai_request_batch_size: int = 10
     ai_batch_size: int | None = None
+    analysis_batch_size: int | None = None
     ai_max_tokens: int = 2000
+    max_output_tokens: int | None = None
     ai_retry_attempts: int = 5
 
     host: str = "127.0.0.1"
@@ -163,12 +167,20 @@ class Settings(BaseSettings):
             self.openrouter_model = DEFAULT_OPENROUTER_MODEL
         if not (self.ai_model or "").strip():
             self.ai_model = DEFAULT_OPENROUTER_MODEL
-        self.ai_max_tokens = clamp_max_tokens(self.ai_max_tokens)
-        self.ai_request_batch_size = clamp_batch_size(
-            self.ai_batch_size if self.ai_batch_size is not None else self.ai_request_batch_size
+        token_cap = self.max_output_tokens if self.max_output_tokens is not None else self.ai_max_tokens
+        self.ai_max_tokens = clamp_max_tokens(token_cap)
+        batch = (
+            self.analysis_batch_size
+            if self.analysis_batch_size is not None
+            else (self.ai_batch_size if self.ai_batch_size is not None else self.ai_request_batch_size)
         )
+        self.ai_request_batch_size = clamp_batch_size(batch)
         self.ai_batch_size = self.ai_request_batch_size
+        self.analysis_batch_size = self.ai_request_batch_size
         self.max_dataset_reviews = clamp_max_dataset_reviews(self.max_dataset_reviews)
+        self.max_analysis_reviews = clamp_max_dataset_reviews(
+            self.max_analysis_reviews or self.max_dataset_reviews
+        )
         return self
 
     @property
@@ -286,20 +298,28 @@ def get_settings() -> Settings:
     if secret_model:
         settings.openrouter_model = secret_model
         settings.ai_model = secret_model
-    secret_tokens = _streamlit_secret("AI_MAX_TOKENS")
+    secret_tokens = _streamlit_secret("AI_MAX_TOKENS") or _streamlit_secret("MAX_OUTPUT_TOKENS")
     if secret_tokens:
         settings.ai_max_tokens = clamp_max_tokens(secret_tokens)
     else:
         settings.ai_max_tokens = clamp_max_tokens(settings.ai_max_tokens)
-    secret_batch = _streamlit_secret("AI_BATCH_SIZE")
+    secret_batch = _streamlit_secret("ANALYSIS_BATCH_SIZE") or _streamlit_secret("AI_BATCH_SIZE")
     if secret_batch:
         settings.ai_batch_size = clamp_batch_size(secret_batch)
         settings.ai_request_batch_size = settings.ai_batch_size
+        settings.analysis_batch_size = settings.ai_batch_size
     secret_limit = _streamlit_secret("MAX_DATASET_REVIEWS")
     if secret_limit:
         settings.max_dataset_reviews = clamp_max_dataset_reviews(secret_limit)
     else:
         settings.max_dataset_reviews = clamp_max_dataset_reviews(settings.max_dataset_reviews)
+    secret_analysis = _streamlit_secret("MAX_ANALYSIS_REVIEWS")
+    if secret_analysis:
+        settings.max_analysis_reviews = clamp_max_dataset_reviews(secret_analysis)
+    else:
+        settings.max_analysis_reviews = clamp_max_dataset_reviews(
+            settings.max_analysis_reviews or settings.max_dataset_reviews
+        )
     settings.ai_provider = "openrouter"
     return settings
 
@@ -330,9 +350,16 @@ def get_ai_config() -> dict:
         "key_prefix": creds.get("key_prefix") or "none",
         "max_tokens": clamp_max_tokens(settings.ai_max_tokens),
         "batch_size": clamp_batch_size(
-            settings.ai_batch_size or settings.ai_request_batch_size or 5
+            settings.analysis_batch_size
+            or settings.ai_batch_size
+            or settings.ai_request_batch_size
+            or 10
         ),
         "max_dataset_reviews": clamp_max_dataset_reviews(settings.max_dataset_reviews),
+        "max_analysis_reviews": clamp_max_dataset_reviews(
+            settings.max_analysis_reviews or settings.max_dataset_reviews
+        ),
+        "prune_excess_reviews": bool(settings.prune_excess_reviews),
         "missing_key_message": (
             "OpenRouter API key is not configured. "
             "Add OPENROUTER_API_KEY to Streamlit Secrets or .env."

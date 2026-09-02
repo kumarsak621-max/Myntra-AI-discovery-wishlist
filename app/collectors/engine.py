@@ -181,23 +181,23 @@ class CollectionEngine:
                     )
 
             from app.pipeline.dataset import enforce_review_limit
+            from config.settings import get_settings as _fresh_settings
 
-            enforce_review_limit(self.db)
+            if _fresh_settings().prune_excess_reviews:
+                enforce_review_limit(self.db)
 
             if analyze:
                 if progress:
                     progress({"stage": "analysis", "status": "start"})
                 from app.ai.provider import AIError
-                from app.pipeline.analysis import smoke_test_analyze_limit
                 from app.pipeline.orchestrator import run_analysis_pipeline
 
-                limit = (
-                    analyze_limit
-                    if analyze_limit is not None
-                    else smoke_test_analyze_limit(self.db, self.settings)
-                )
                 try:
-                    result = run_analysis_pipeline(self.db, progress=progress, analyze_limit=limit)
+                    result = run_analysis_pipeline(
+                        self.db,
+                        progress=progress,
+                        analyze_limit=analyze_limit,
+                    )
                     combined.analyzed = result.analyzed
                     combined.analysis_failed = result.failed
                     if result.last_error:

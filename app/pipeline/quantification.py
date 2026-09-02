@@ -11,6 +11,11 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.models import Analysis, Review
+from app.pipeline.labels import (
+    merge_category_rows,
+    normalize_category_label,
+    normalize_label_list,
+)
 from config.settings import official_ids
 
 logger = logging.getLogger(__name__)
@@ -163,8 +168,7 @@ def label_distribution(
     }[field]
 
     for review, analysis in items:
-        labels = [str(x).strip() for x in _loads(getattr(analysis, attr)) if str(x).strip()]
-        unique_labels = list(dict.fromkeys(labels))
+        unique_labels = normalize_label_list(_loads(getattr(analysis, attr)))
         for label in unique_labels:
             key = label
             counts[key] += 1
@@ -244,7 +248,7 @@ def information_seeking(db: Session, *, myntra_only: bool = False) -> list[dict[
         for item in _loads(analysis.information_seeking_json):
             if not isinstance(item, dict):
                 continue
-            source = str(item.get("source") or "unspecified")
+            source = normalize_category_label(item.get("source") or "unspecified")
             counts[source] += 1
             details[source].append(
                 {
@@ -311,17 +315,15 @@ def _json_labels(analysis: Analysis, field: str) -> list[str]:
         "themes": None,
     }.get(field, "barriers_json")
     if field == "root_cause":
-        statement = (analysis.root_cause or "").strip()
-        return [statement] if statement else []
+        return [normalize_category_label(analysis.root_cause)]
     if field == "themes":
         bag = []
         for key in ("barriers_json", "uncertainties_json", "intent_json"):
-            bag.extend(str(x).strip() for x in _loads(getattr(analysis, key)) if str(x).strip())
-        if (analysis.root_cause or "").strip():
-            bag.append(analysis.root_cause.strip())
-        return list(dict.fromkeys(bag))
-    labels = [str(x).strip() for x in _loads(getattr(analysis, attr)) if str(x).strip()]
-    return list(dict.fromkeys(labels))
+            bag.extend(_loads(getattr(analysis, key)))
+        if analysis.root_cause:
+            bag.append(analysis.root_cause)
+        return normalize_label_list(bag, keep_uncategorized_if_only_missing=True)
+    return normalize_label_list(_loads(getattr(analysis, attr)))
 
 
 def label_window_momentum(
@@ -359,9 +361,10 @@ def label_window_momentum(
         day = stamp.strftime("%Y-%m-%d")
         bucket = first if stamp < midpoint else second
         for label in labels:
-            bucket[label] += 1
-            evidence[label].append(review.id)
-            daily[label][day] += 1
+            key = normalize_category_label(label)
+            bucket[key] += 1
+            evidence[key].append(review.id)
+            daily[key][day] += 1
 
     names = set(first) | set(second)
     ranked = []
@@ -390,7 +393,7 @@ def label_window_momentum(
             }
         )
     ranked.sort(key=lambda x: (-int(x["count"]), str(x["label"])))
-    return ranked
+    return merge_category_rows(ranked)
 
 
 def root_cause_distribution(
@@ -405,9 +408,7 @@ def root_cause_distribution(
         if not analysis or not analysis.is_valid_json:
             continue
         analyzed += 1
-        statement = (analysis.root_cause or "").strip()
-        if not statement:
-            continue
+        statement = normalize_category_label(analysis.root_cause)
         counts[statement] += 1
         review_ids[statement].append(review.id)
     return [
@@ -876,13 +877,15 @@ def root_cause_hierarchy(
             analysis = review.analysis
             if not analysis or not analysis.is_valid_json:
                 continue
-            for label in [str(x).strip() for x in _loads(analysis.barriers_json) if str(x).strip()]:
+            for label in normalize_label_list(_loads(analysis.barriers_json), keep_uncategorized_if_only_missing=False):
                 barriers[label] += 1
-            for label in [str(x).strip() for x in _loads(analysis.uncertainties_json) if str(x).strip()]:
+            for label in normalize_label_list(
+                _loads(analysis.uncertainties_json), keep_uncategorized_if_only_missing=False
+            ):
                 uncertainties[label] += 1
             for raw in _loads(analysis.information_seeking_json):
                 if isinstance(raw, dict) and raw.get("source"):
-                    seeking[str(raw.get("source"))] += 1
+                    seeking[normalize_category_label(raw.get("source"))] += 1
             if analysis.purchase_hesitation in {"explicit", "implicit"}:
                 hesitation += 1
         top_barrier = barriers.most_common(1)[0][0] if barriers else ""

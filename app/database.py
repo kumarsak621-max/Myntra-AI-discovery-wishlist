@@ -73,8 +73,10 @@ def init_db() -> None:
     db = SessionLocal()
     try:
         from app.pipeline.dataset import enforce_review_limit
+        from config.settings import get_settings as _settings
 
-        enforce_review_limit(db)
+        if _settings().prune_excess_reviews:
+            enforce_review_limit(db)
     finally:
         db.close()
     ensure_pending_analysis_rows()
@@ -282,20 +284,26 @@ def get_database_diagnostics(db: Session | None = None) -> dict[str, Any]:
             last_error = redact_secrets(str(last_fail_row[0]))
         settings = get_settings()
         path = sqlite_path()
+        from app.pipeline.dataset import analysis_dataset_stats
         from config.settings import clamp_max_dataset_reviews
 
+        stats = analysis_dataset_stats(session)
         return {
             "database_path": str(path) if path else "",
             "total_reviews": all_q.count(),
             "myntra_reviews": myntra_q.count(),
+            "available_reviews": stats.get("available_reviews") or myntra_q.count(),
+            "selected_reviews": stats.get("selected_reviews") or 0,
             "google_play_reviews": gp,
             "apple_reviews": apple,
             "apple_app_store_reviews": apple,
             "last_30_day_reviews": window_q.count(),
-            "pending_reviews": pending + no_row,
-            "analyzed_reviews": analyzed,
-            "failed_reviews": failed,
+            "pending_reviews": stats.get("pending_reviews") or 0,
+            "analyzed_reviews": stats.get("analyzed_reviews") or 0,
+            "failed_reviews": stats.get("failed_reviews") or 0,
             "max_dataset_reviews": clamp_max_dataset_reviews(settings.max_dataset_reviews),
+            "max_analysis_reviews": stats.get("max_analysis_reviews")
+            or clamp_max_dataset_reviews(settings.max_analysis_reviews),
             "themes": session.query(Theme).count(),
             "segments": session.query(Segment).count(),
             "opportunities": session.query(Opportunity).count(),
@@ -355,13 +363,17 @@ def get_ai_diagnostics(db: Session | None = None) -> dict[str, Any]:
             "api_key_configured": "YES" if settings.has_ai_credentials else "NO",
             "max_tokens": int(getattr(settings, "ai_max_tokens", 2000) or 2000),
             "batch_size": int(
-                getattr(settings, "ai_batch_size", None)
-                or getattr(settings, "ai_request_batch_size", 5)
-                or 5
+                getattr(settings, "analysis_batch_size", None)
+                or getattr(settings, "ai_batch_size", None)
+                or getattr(settings, "ai_request_batch_size", 10)
+                or 10
             ),
             "pending_reviews": base.get("pending_reviews") or 0,
             "analyzed_reviews": base.get("analyzed_reviews") or 0,
             "failed_reviews": base.get("failed_reviews") or 0,
+            "available_reviews": base.get("available_reviews") or base.get("myntra_reviews") or 0,
+            "selected_reviews": base.get("selected_reviews") or 0,
+            "max_analysis_reviews": base.get("max_analysis_reviews") or 300,
             "last_successful_analysis": base.get("last_successful_analysis_at"),
             "last_failed_analysis": last_fail_at.isoformat() if last_fail_at else None,
             "last_error": last_error or None,

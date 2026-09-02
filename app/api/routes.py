@@ -23,6 +23,7 @@ from app.models import CollectionRun, Opportunity, Review, Segment, Source, Them
 from app.pipeline.cleaning import clean_review
 from app.pipeline.dedup import content_hash
 from app.pipeline.orchestrator import run_analysis_pipeline
+from app.pipeline.labels import merge_category_rows
 from app.pipeline.quantification import (
     information_seeking,
     label_distribution,
@@ -535,38 +536,48 @@ def uncertainties(myntra_only: bool = True, db: Session = Depends(get_db)) -> li
 @router.get("/themes")
 def themes(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
     rows = db.query(Theme).order_by(Theme.review_count.desc()).all()
-    return [
-        {
-            "id": t.id,
-            "name": t.name,
-            "description": t.description,
-            "review_count": t.review_count,
-            "myntra_review_count": t.myntra_review_count,
-            "reference_review_count": t.reference_review_count,
-            "sources": _loads(t.sources_json),
-            "evidence_ids": _loads(t.evidence_ids_json),
-            "is_emergent": t.is_emergent,
-        }
-        for t in rows
-    ]
+    return merge_category_rows(
+        [
+            {
+                "id": t.id,
+                "name": t.name,
+                "description": t.description,
+                "review_count": t.review_count,
+                "myntra_review_count": t.myntra_review_count,
+                "reference_review_count": t.reference_review_count,
+                "sources": _loads(t.sources_json),
+                "evidence_ids": _loads(t.evidence_ids_json),
+                "is_emergent": t.is_emergent,
+            }
+            for t in rows
+        ],
+        label_keys=("name", "label"),
+        count_keys=("review_count", "count"),
+        id_keys=("evidence_ids", "review_ids"),
+    )
 
 
 @router.get("/segments")
 def segments(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
     rows = db.query(Segment).order_by(Segment.review_count.desc()).all()
-    return [
-        {
-            "id": s.id,
-            "name": s.name,
-            "description": s.description,
-            "basis": s.basis,
-            "review_count": s.review_count,
-            "myntra_review_count": s.myntra_review_count,
-            "sources": _loads(s.sources_json),
-            "evidence_ids": _loads(s.evidence_ids_json),
-        }
-        for s in rows
-    ]
+    return merge_category_rows(
+        [
+            {
+                "id": s.id,
+                "name": s.name,
+                "description": s.description,
+                "basis": s.basis,
+                "review_count": s.review_count,
+                "myntra_review_count": s.myntra_review_count,
+                "sources": _loads(s.sources_json),
+                "evidence_ids": _loads(s.evidence_ids_json),
+            }
+            for s in rows
+        ],
+        label_keys=("name", "label"),
+        count_keys=("review_count", "count"),
+        id_keys=("evidence_ids", "review_ids"),
+    )
 
 
 @router.get("/information-seeking")

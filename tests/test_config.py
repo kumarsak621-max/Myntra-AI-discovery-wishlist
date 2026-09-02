@@ -78,6 +78,7 @@ def test_get_ai_config_never_returns_key():
     assert int(cfg["max_tokens"]) != 65535
     assert 1 <= int(cfg["batch_size"]) <= 10
     assert int(cfg["max_dataset_reviews"]) == 300 or int(cfg["max_dataset_reviews"]) >= 1
+    assert int(cfg.get("max_analysis_reviews") or 300) >= 1
     assert int(cfg["max_dataset_reviews"]) != 1300
     assert "openrouter_api_key" not in cfg
     assert "api_key" not in cfg

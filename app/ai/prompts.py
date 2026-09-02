@@ -19,13 +19,14 @@ If the review is unrelated to shopping or purchase hesitation, set evidence_type
 ANALYSIS_ITEM_SCHEMA = """{
   "id": "supplied review id",
   "problem": "",
+  "root_cause": "",
   "wishlist_signal": false,
+  "wishlist_behavior": "",
   "purchase_barrier": "",
   "uncertainty": "",
   "theme": "",
   "segment": "",
   "severity": 1,
-  "purchase_impact": 1,
   "evidence_type": "explicit|inferred|none",
   "confidence": 0.0
 }"""
@@ -55,7 +56,7 @@ TEXT:
 Schema:
 {ANALYSIS_ITEM_SCHEMA}
 
-Use short phrases. Empty strings if unsupported. Do not assume wishlist unless the text supports it.
+Use short phrases. Empty string if the review has no evidence for a field. Do not invent. Do not assume wishlist unless the text supports it.
 """
 
 
@@ -86,7 +87,7 @@ def analysis_batch_user_prompt(items: list[dict]) -> str:
   ]
 }}
 
-One results[] object per review. Use the supplied REVIEW ID. Short phrases only.
+One results[] object per review. Use the supplied REVIEW ID. Short phrases only. Empty fields if unsupported.
 
 REVIEWS:
 

@@ -161,6 +161,7 @@ def test_analyzed_reviews_are_skipped(db):
     row.analysis.status = "analyzed"
     row.analysis.is_valid_json = True
     row.analysis.content_hash = row.content_hash
+    row.analysis.analysis_version = "1"
     db.commit()
     pending = _insert(db, "need-me", "Wishlisted jeans. Not sure they will fit.")
 
@@ -177,8 +178,22 @@ def test_analyzed_reviews_are_skipped(db):
     db.commit()
     assert calls["n"] == 1
     assert result.analyzed == 1
+    assert result.skipped_already_analyzed >= 1
     assert pending.analysis.status == "analyzed"
     assert row.analysis.status == "analyzed"
+
+
+def test_smoke_limit_is_remaining_pending_not_one(db):
+    from app.pipeline.analysis import smoke_test_analyze_limit
+
+    for i in range(8):
+        _insert(db, f"pending-{i}", "Wishlisted a dress. Size chart is missing so I did not buy.")
+    db.commit()
+    settings = _settings()
+    limit = smoke_test_analyze_limit(db, settings)
+    assert limit == 8
+    assert limit != 1
+    assert limit != 5
 
 
 def test_failed_reviews_are_retried(db):

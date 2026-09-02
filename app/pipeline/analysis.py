@@ -16,8 +16,8 @@ from app.ai.provider import AIError, AIProvider, redact_secrets
 from app.ai.schema import parse_batch_payload, try_validate_analysis, try_validate_payload
 from app.config import get_settings
 from app.models import Analysis, Review, utcnow
+from app.pipeline.labels import stored_category_text
 from app.schemas import RootCauseItem
-from config.settings import official_ids
 
 ANALYSIS_VERSION = "1"
 
@@ -33,6 +33,11 @@ class AnalysisRunResult:
     last_error: str = ""
     processed: int = 0
     last_http_status: int | None = None
+    selected: int = 0
+    batches_processed: int = 0
+    successful_batches: int = 0
+    failed_batches: int = 0
+    skipped_already_analyzed: int = 0
 
 
 def _original_blob(review: Review) -> str:
@@ -42,23 +47,21 @@ def _original_blob(review: Review) -> str:
 def _request_batch_size(settings) -> int:
     from config.settings import clamp_batch_size
 
-    alias = getattr(settings, "ai_batch_size", None)
-    return clamp_batch_size(alias or getattr(settings, "ai_request_batch_size", 5) or 5)
+    alias = getattr(settings, "analysis_batch_size", None) or getattr(settings, "ai_batch_size", None)
+    return clamp_batch_size(alias or getattr(settings, "ai_request_batch_size", 10) or 10)
+
+
+def remaining_analysis_limit(db: Session, settings) -> int:
+    """Pending reviews in the selected analysis dataset. Not a smoke-test cap."""
+    from app.pipeline.dataset import analysis_dataset_stats
+
+    stats = analysis_dataset_stats(db)
+    return max(0, int(stats.get("pending_reviews") or 0) + int(stats.get("failed_reviews") or 0))
 
 
 def smoke_test_analyze_limit(db: Session, settings) -> int:
-    """First run: 1 review. Next runs until 6 analyzed: 5. Then the configured cap."""
-    from app.database import get_database_diagnostics
-
-    configured = int(getattr(settings, "ai_analysis_batch_size", 60) or 60)
-    configured = max(1, configured)
-    diag = get_database_diagnostics(db)
-    analyzed = int(diag.get("analyzed_reviews") or 0)
-    if analyzed == 0:
-        return 1
-    if analyzed < 6:
-        return min(configured, 5)
-    return configured
+    """Deprecated alias kept for callers. Returns remaining selected reviews, never 1-then-5."""
+    return remaining_analysis_limit(db, settings)
 
 
 def _chunks(items: Sequence[Review], size: int) -> list[list[Review]]:
@@ -109,21 +112,29 @@ def persist_analysis(
         row.wishlist_signal = parsed.wishlist_signal
         row.purchase_signal = parsed.purchase_signal
         row.purchase_hesitation = parsed.purchase_hesitation
-        row.intent_json = json.dumps(parsed.intent)
-        row.barriers_json = json.dumps(parsed.barriers)
-        row.uncertainties_json = json.dumps(parsed.uncertainties)
+        row.intent_json = json.dumps([stored_category_text(x) for x in parsed.intent if stored_category_text(x)])
+        row.barriers_json = json.dumps([stored_category_text(x) for x in parsed.barriers if stored_category_text(x)])
+        row.uncertainties_json = json.dumps(
+            [stored_category_text(x) for x in parsed.uncertainties if stored_category_text(x)]
+        )
         row.information_seeking_json = json.dumps(
             [i.model_dump() for i in parsed.information_seeking]
         )
         row.behavioral_signals_json = json.dumps(
             [i.model_dump() for i in parsed.behavioral_signals]
         )
-        row.product_category_json = json.dumps(parsed.product_category)
-        row.decision_factors_json = json.dumps(parsed.decision_factors)
-        row.root_cause_observed = root.observed
-        row.root_cause_inferred = root.inferred
-        row.root_cause_hypothesized = root.hypothesized
-        row.root_cause = root.statement or root.hypothesized or root.inferred or root.observed
+        row.product_category_json = json.dumps(
+            [stored_category_text(x) for x in parsed.product_category if stored_category_text(x)]
+        )
+        row.decision_factors_json = json.dumps(
+            [stored_category_text(x) for x in parsed.decision_factors if stored_category_text(x)]
+        )
+        row.root_cause_observed = stored_category_text(root.observed)
+        row.root_cause_inferred = stored_category_text(root.inferred)
+        row.root_cause_hypothesized = stored_category_text(root.hypothesized)
+        row.root_cause = stored_category_text(
+            root.statement or root.hypothesized or root.inferred or root.observed
+        )
         row.sentiment = parsed.sentiment
         row.evidence_strength = parsed.evidence_strength
         row.confidence = parsed.confidence
@@ -137,25 +148,18 @@ def reviews_needing_analysis(
     only_failed: bool = False,
     include_failed: bool = True,
 ) -> list[Review]:
-    """Select Myntra-valid reviews that still need OpenRouter analysis.
+    """Select Myntra-valid reviews in the analysis dataset that still need OpenRouter analysis.
 
-    Analyze Pending: pending / missing / stale-hash rows (include_failed=False).
-    Retry Failed: only status=failed (only_failed=True).
-    Default pipeline: pending and failed, never successfully analyzed rows.
+    Already-analyzed rows with a matching content hash and analysis_version are skipped.
     """
-    rows = (
-        db.query(Review)
-        .filter(
-            Review.is_empty.is_(False),
-            Review.is_valid_source.is_(True),
-            Review.app_id.in_(list(official_ids())),
-        )
-        .all()
-    )
+    from app.pipeline.dataset import select_analysis_reviews
+
+    selected = select_analysis_reviews(db)
     needed: list[Review] = []
-    for review in rows:
+    for review in selected:
         analysis = review.analysis
         status = getattr(analysis, "status", "") if analysis is not None else ""
+        version = str(getattr(analysis, "analysis_version", "") or "") if analysis is not None else ""
         if only_failed:
             if analysis is not None and status == "failed":
                 needed.append(review)
@@ -166,11 +170,16 @@ def reviews_needing_analysis(
         if analysis.content_hash != review.content_hash:
             needed.append(review)
             continue
-        if status == "analyzed" and analysis.is_valid_json:
+        if (
+            status == "analyzed"
+            and analysis.is_valid_json
+            and version == ANALYSIS_VERSION
+        ):
             continue
         if status == "failed" and not include_failed:
             continue
         needed.append(review)
+    needed.sort(key=lambda row: (int(row.id or 0),))
     return needed
 
 
@@ -190,6 +199,43 @@ def _prompt_items(reviews: Sequence[Review], max_chars: int) -> list[dict[str, A
             }
         )
     return items
+
+
+def _analyze_chunk(
+    db: Session,
+    provider: AIProvider,
+    chunk: list[Review],
+    *,
+    max_chars: int,
+    shrink_depth: int = 0,
+) -> tuple[int, int, str, int | None, int, int]:
+    """Returns analyzed, failed, error, http_status, successful_batches, failed_batches."""
+    analyzed, failed, error, http_status = _analyze_batch(db, provider, chunk, max_chars=max_chars)
+    if http_status == 402:
+        return analyzed, failed, error, http_status, 0, 1
+    if (
+        analyzed == 0
+        and failed == len(chunk)
+        and http_status in {400, 413}
+        and len(chunk) > 1
+        and shrink_depth < 2
+    ):
+        mid = max(1, len(chunk) // 2)
+        left = _analyze_chunk(db, provider, chunk[:mid], max_chars=max_chars, shrink_depth=shrink_depth + 1)
+        if left[3] == 402:
+            return left
+        right = _analyze_chunk(db, provider, chunk[mid:], max_chars=max_chars, shrink_depth=shrink_depth + 1)
+        return (
+            left[0] + right[0],
+            left[1] + right[1],
+            right[2] or left[2],
+            right[3] or left[3],
+            left[4] + right[4],
+            left[5] + right[5],
+        )
+    if analyzed:
+        return analyzed, failed, error, http_status, 1, 1 if failed else 0
+    return analyzed, failed, error, http_status, 0, 1
 
 
 def analyze_review(provider: AIProvider, review: Review) -> tuple[Any, str, str]:
@@ -288,17 +334,22 @@ def analyze_new_reviews(
 ) -> AnalysisRunResult:
     provider = provider or AIProvider(get_settings())
     settings = getattr(provider, "settings", None) or get_settings()
-    from app.pipeline.dataset import enforce_review_limit
+    from app.pipeline.dataset import analysis_dataset_stats, select_analysis_reviews
 
-    enforce_review_limit(db, getattr(settings, "max_dataset_reviews", None))
+    selected = select_analysis_reviews(db)
+    stats = analysis_dataset_stats(db)
     pending = reviews_needing_analysis(
         db, only_failed=only_failed, include_failed=include_failed
     )
     total_pending = len(pending)
+    already_analyzed = int(stats.get("analyzed_reviews") or 0)
     if limit is not None:
         pending = pending[:limit]
 
-    result = AnalysisRunResult()
+    result = AnalysisRunResult(
+        selected=len(selected),
+        skipped_already_analyzed=already_analyzed,
+    )
     if not pending:
         from app.database import get_review_count
 
@@ -308,7 +359,17 @@ def analyze_new_reviews(
             else "No new Myntra-valid reviews needed analysis (already analyzed)."
         )
         if progress:
-            progress({"stage": "analysis", "status": "skipped", "message": message})
+            progress(
+                {
+                    "stage": "analysis",
+                    "status": "skipped",
+                    "message": message,
+                    "selected": result.selected,
+                    "analyzed_total": already_analyzed,
+                    "pending_total": 0,
+                    "failed_total": int(stats.get("failed_reviews") or 0),
+                }
+            )
         return result
 
     if not provider.available():
@@ -325,15 +386,26 @@ def analyze_new_reviews(
     batch_size = _request_batch_size(settings)
     rate = float(getattr(settings, "ai_rate_limit_seconds", 0) or 0)
     max_chars = int(getattr(settings, "ai_max_review_chars", 4000) or 4000)
+    if batch_size >= 5:
+        max_chars = min(max_chars, 1500)
+    chunks = _chunks(pending, batch_size)
+    batch_total = len(chunks)
     processed = 0
+    analyzed_total = already_analyzed
+    failed_total = int(stats.get("failed_reviews") or 0)
 
     try:
-        for chunk in _chunks(pending, batch_size):
+        for batch_index, chunk in enumerate(chunks, start=1):
             if rate > 0:
                 time.sleep(rate)
-            analyzed, failed, error, http_status = _analyze_batch(db, provider, chunk, max_chars=max_chars)
+            analyzed, failed, error, http_status, ok_batches, bad_batches = _analyze_chunk(
+                db, provider, chunk, max_chars=max_chars
+            )
             result.analyzed += analyzed
             result.failed += failed
+            result.batches_processed += max(1, ok_batches + bad_batches)
+            result.successful_batches += ok_batches
+            result.failed_batches += bad_batches
             if http_status == 402:
                 result.last_error = error
                 result.last_http_status = http_status
@@ -341,11 +413,15 @@ def analyze_new_reviews(
                 break
             result.processed += len(chunk)
             processed += len(chunk)
+            analyzed_total += analyzed
+            failed_total += failed
             if error:
                 result.last_error = error
             if http_status:
                 result.last_http_status = http_status
             db.commit()
+            pending_left = max(0, result.selected - analyzed_total - failed_total)
+            percent = int(round(100 * analyzed_total / max(1, result.selected)))
             if progress:
                 progress(
                     {
@@ -355,6 +431,13 @@ def analyze_new_reviews(
                         "failed": result.failed,
                         "processed": processed,
                         "total": len(pending),
+                        "selected": result.selected,
+                        "analyzed_total": analyzed_total,
+                        "pending_total": pending_left,
+                        "failed_total": failed_total,
+                        "batch_index": batch_index,
+                        "batch_total": batch_total,
+                        "percent": percent,
                         "message": error,
                     }
                 )
@@ -369,6 +452,11 @@ def analyze_new_reviews(
                     "analyzed": result.analyzed,
                     "failed": result.failed,
                     "total": len(pending),
+                    "selected": result.selected,
+                    "analyzed_total": analyzed_total,
+                    "batches_processed": result.batches_processed,
+                    "successful_batches": result.successful_batches,
+                    "failed_batches": result.failed_batches,
                     "message": result.last_error,
                 }
             )

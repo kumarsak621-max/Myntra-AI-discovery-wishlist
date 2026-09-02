@@ -69,6 +69,8 @@ def run_diagnostics() -> dict:
                 "pending_reviews": base.get("pending_reviews") or 0,
                 "analyzed_reviews": base.get("analyzed_reviews") or 0,
                 "failed_reviews": base.get("failed_reviews") or 0,
+                "available_reviews": base.get("available_reviews") or base.get("myntra_reviews") or 0,
+                "selected_reviews": base.get("selected_reviews") or 0,
             },
             "collectors": {
                 "google_play_status": getattr(gp, "validation_status", None) or "not collected",
@@ -112,6 +114,8 @@ def print_report(report: dict) -> None:
     print("--------")
     print("Path:", db["path"])
     print("Total reviews:", db["total_reviews"])
+    print("Available:", db.get("available_reviews") or db["total_reviews"])
+    print("Selected:", db.get("selected_reviews") or "n/a")
     print("Google reviews:", db["google_play_reviews"])
     print("Apple reviews:", db["apple_reviews"])
     print("Last 30 days:", db["last_30_day_reviews"])

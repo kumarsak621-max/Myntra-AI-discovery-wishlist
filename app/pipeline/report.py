@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.models import Opportunity, Review, Segment, Source, Theme
+from app.pipeline.labels import merge_category_rows
 from app.pipeline.quantification import (
     information_seeking,
     label_distribution,
@@ -197,18 +198,24 @@ def build_report(db: Session) -> dict[str, Any]:
                 for s in segments
             ],
             "12_category_differences": label_distribution(db, "product_category", myntra_only=False),
-            "13_emergent_themes": [
-                {
-                    "name": t.name,
-                    "description": t.description,
-                    "review_count": t.review_count,
-                    "myntra_review_count": t.myntra_review_count,
-                    "reference_review_count": t.reference_review_count,
-                    "sources": _loads(t.sources_json),
-                    "is_emergent": t.is_emergent,
-                }
-                for t in themes
-            ],
+            "13_emergent_themes": merge_category_rows(
+                [
+                    {
+                        "name": t.name,
+                        "description": t.description,
+                        "review_count": t.review_count,
+                        "myntra_review_count": t.myntra_review_count,
+                        "reference_review_count": t.reference_review_count,
+                        "sources": _loads(t.sources_json),
+                        "is_emergent": t.is_emergent,
+                        "evidence_ids": _loads(t.evidence_ids_json),
+                    }
+                    for t in themes
+                ],
+                label_keys=("name", "label"),
+                count_keys=("review_count", "count"),
+                id_keys=("evidence_ids", "review_ids"),
+            ),
             "14_root_causes": [
                 {
                     "name": o.user_problem,

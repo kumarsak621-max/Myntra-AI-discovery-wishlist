@@ -14,6 +14,7 @@ from app.schemas import (
     ReviewAnalysisSchema,
     RootCauseItem,
 )
+from app.pipeline.labels import is_placeholder_label, stored_category_text
 
 FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 
@@ -126,15 +127,23 @@ def sanitize_quotes(analysis: ReviewAnalysisSchema, original_text: str) -> Revie
 
 def normalize_root_cause(value: RootCauseItem | str | dict | None) -> RootCauseItem:
     if isinstance(value, RootCauseItem):
-        return value
-    if isinstance(value, dict):
         return RootCauseItem(
-            observed=str(value.get("observed") or ""),
-            inferred=str(value.get("inferred") or ""),
-            hypothesized=str(value.get("hypothesized") or ""),
-            statement=str(value.get("statement") or ""),
+            observed=stored_category_text(value.observed),
+            inferred=stored_category_text(value.inferred),
+            hypothesized=stored_category_text(value.hypothesized),
+            statement=stored_category_text(value.statement or value.hypothesized or value.inferred or value.observed),
         )
-    statement = str(value or "").strip()
+    if isinstance(value, dict):
+        statement = stored_category_text(
+            value.get("statement") or value.get("hypothesized") or value.get("inferred") or value.get("observed")
+        )
+        return RootCauseItem(
+            observed=stored_category_text(value.get("observed") or ""),
+            inferred=stored_category_text(value.get("inferred") or ""),
+            hypothesized=stored_category_text(value.get("hypothesized") or ""),
+            statement=statement,
+        )
+    statement = stored_category_text(value)
     return RootCauseItem(statement=statement, hypothesized=statement)
 
 
@@ -148,20 +157,29 @@ def try_validate_payload(
     payload: dict[str, Any], original_text: str
 ) -> tuple[ReviewAnalysisSchema | None, str]:
     cleaned = {key: value for key, value in payload.items() if key not in {"id", "source_review_id"}}
-    if cleaned.get("user_problem") and not cleaned.get("root_cause"):
-        cleaned["root_cause"] = {"statement": str(cleaned.get("user_problem") or "")}
-    if cleaned.get("problem") and not cleaned.get("root_cause"):
-        cleaned["root_cause"] = {"statement": str(cleaned.get("problem") or "")}
+
+    def _meaningful(value: Any) -> str:
+        return stored_category_text(value)
+
+    problem_text = _meaningful(cleaned.get("user_problem")) or _meaningful(cleaned.get("problem"))
+    if problem_text and not cleaned.get("root_cause"):
+        cleaned["root_cause"] = {"statement": problem_text}
     barrier = cleaned.get("purchase_barrier")
     if barrier and not cleaned.get("barriers"):
-        cleaned["barriers"] = barrier if isinstance(barrier, list) else [str(barrier)]
+        if isinstance(barrier, list):
+            cleaned["barriers"] = [stored_category_text(x) for x in barrier if stored_category_text(x)]
+        elif not is_placeholder_label(barrier):
+            cleaned["barriers"] = [stored_category_text(barrier)]
     uncertainty = cleaned.get("uncertainty")
     if uncertainty and not cleaned.get("uncertainties"):
-        cleaned["uncertainties"] = uncertainty if isinstance(uncertainty, list) else [str(uncertainty)]
-    theme = str(cleaned.get("theme") or "").strip()
+        if isinstance(uncertainty, list):
+            cleaned["uncertainties"] = [stored_category_text(x) for x in uncertainty if stored_category_text(x)]
+        elif not is_placeholder_label(uncertainty):
+            cleaned["uncertainties"] = [stored_category_text(uncertainty)]
+    theme = _meaningful(cleaned.get("theme"))
     if theme and not cleaned.get("intent"):
         cleaned["intent"] = [theme]
-    segment = str(cleaned.get("segment") or "").strip()
+    segment = _meaningful(cleaned.get("segment"))
     if segment:
         factors = list(cleaned.get("decision_factors") or [])
         if segment not in factors:
@@ -189,9 +207,10 @@ def try_validate_payload(
         if not value:
             return []
         if isinstance(value, list):
-            return [str(item).strip() for item in value if str(item).strip()]
-        text = str(value).strip()
-        return [text] if text else []
+            items = [stored_category_text(item) for item in value]
+        else:
+            items = [stored_category_text(value)]
+        return [text for text in items if text]
 
     def _merge(dest: str, extra: str) -> None:
         added = _as_list(cleaned.get(extra))
@@ -205,8 +224,9 @@ def try_validate_payload(
     _merge("intent", "themes")
     _merge("decision_factors", "segments")
     _merge("decision_factors", "comparison_factors")
-    if _as_list(cleaned.get("problems")) and not cleaned.get("root_cause"):
-        cleaned["root_cause"] = {"statement": _as_list(cleaned.get("problems"))[0]}
+    first_problem = (_as_list(cleaned.get("problems")) or [None])[0]
+    if first_problem and not cleaned.get("root_cause"):
+        cleaned["root_cause"] = {"statement": first_problem}
     seeking = list(cleaned.get("information_seeking") or [])
     for src in _as_list(cleaned.get("external_information_seeking")):
         if isinstance(seeking, list):

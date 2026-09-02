@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from dashboard.chat import ask_product_assistant, retrieve_evidence
 from dashboard.insights import pm_insight
+from app.pipeline.labels import normalize_category_label
 
 DISCOVERY_QUESTIONS = [
     "Why do users add fashion products to their wishlist?",
@@ -31,7 +32,7 @@ def _rows_summary(rows: list[dict[str, Any]] | None, *, name="label", count="cou
         return INSUFFICIENT
     parts = []
     for row in items[:5]:
-        label = row.get(name) or row.get("problem") or row.get("label")
+        label = normalize_category_label(row.get(name) or row.get("problem") or row.get("label"))
         n = row.get(count) or row.get("frequency") or 0
         pct = row.get("percentage")
         extra = f" ({pct}%)" if pct is not None else ""

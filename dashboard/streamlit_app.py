@@ -21,6 +21,7 @@ from app.database import (
 )
 from app.models import CollectionRun, Opportunity, Review, Segment, Theme
 from app.pipeline.dates import ensure_aware, get_last_30_days_cutoff, humanize_ago, utcnow
+from app.pipeline.labels import merge_category_rows, normalize_category_label, normalize_label_list
 from app.pipeline.quantification import (
     BARRIER_TERMS,
     COMPARISON_METHOD_TERMS,
@@ -53,7 +54,7 @@ from config.settings import (
     get_settings,
     reload_settings,
 )
-from dashboard.charts import bar_chart, donut_chart, heatmap_impact_frequency, scatter_chart
+from dashboard.charts import bar_chart, donut_chart, heatmap_impact_frequency, scatter_chart, trend_frame
 from dashboard.chat import ask_product_assistant
 from dashboard.insights import funnel_stages, pm_insight, why_this_matters, wishlist_conversion_copy
 from dashboard.questions import DISCOVERY_QUESTIONS, answer_discovery_questions
@@ -286,11 +287,21 @@ def _load_bundle(since_iso: str | None, source: str, cache_token: str) -> dict:
         metrics = overview_metrics(db, since=since, myntra_only=True, source=src)
         diag = get_database_diagnostics(db)
         signals = signal_counts(db, myntra_only=True, since=since, source=src)
-        problems = problem_rows(db, myntra_only=True, since=since, source=src)
-        intents = label_distribution(db, "intent", myntra_only=True, relevant_only=False, since=since, source=src)
-        barriers = label_distribution(db, "barriers", myntra_only=True, relevant_only=False, since=since, source=src)
-        uncertainties = label_distribution(
-            db, "uncertainties", myntra_only=True, relevant_only=False, since=since, source=src
+        problems = merge_category_rows(
+            problem_rows(db, myntra_only=True, since=since, source=src),
+            label_keys=("problem", "label"),
+            count_keys=("frequency", "count", "supporting_reviews"),
+        )
+        intents = merge_category_rows(
+            label_distribution(db, "intent", myntra_only=True, relevant_only=False, since=since, source=src)
+        )
+        barriers = merge_category_rows(
+            label_distribution(db, "barriers", myntra_only=True, relevant_only=False, since=since, source=src)
+        )
+        uncertainties = merge_category_rows(
+            label_distribution(
+                db, "uncertainties", myntra_only=True, relevant_only=False, since=since, source=src
+            )
         )
         wishlist_beh = taxonomy_counts(db, WISHLIST_BEHAVIOR_TERMS, since=since, source=src)
         barrier_tax = taxonomy_counts(db, BARRIER_TERMS, since=since, source=src)
@@ -301,46 +312,65 @@ def _load_bundle(since_iso: str | None, source: str, cache_token: str) -> dict:
         social = taxonomy_counts(db, SOCIAL_TERMS, since=since, source=src)
         purchase_beh = taxonomy_counts(db, PURCHASE_BEHAVIOR_TERMS, since=since, source=src)
         purchase_signals = purchase_signal_counts(db, since=since, source=src)
-        root_causes = root_cause_hierarchy(db, since=since, source=src)
+        root_causes = merge_category_rows(
+            root_cause_hierarchy(db, since=since, source=src),
+            label_keys=("root_cause", "problem", "label"),
+            count_keys=("count", "frequency"),
+        )
         wishlist_intent = wishlist_intent_split(db, since=since, source=src)
         segment_tax = taxonomy_counts(db, SEGMENT_TERMS, since=since, source=src)
         ratings = rating_distribution(db, since=since, source=src)
         latest = latest_review_cards(db, since=since, source=src, limit=8)
         daily = daily_review_trends(db, myntra_only=True, since=since)
-        themes = [
-            {
-                "name": t.name,
-                "review_count": t.review_count,
-                "evidence_ids": _json_ids(t.evidence_ids_json),
-            }
-            for t in db.query(Theme).order_by(Theme.review_count.desc()).all()
-        ]
-        segments = [
-            {
-                "name": s.name,
-                "review_count": s.review_count,
-                "basis": s.basis,
-                "evidence_ids": _json_ids(s.evidence_ids_json),
-            }
-            for s in db.query(Segment).order_by(Segment.review_count.desc()).all()
-        ]
-        opps = [
-            {
-                "rank": o.rank,
-                "name": o.name,
-                "reach": o.reach,
-                "frequency": o.frequency,
-                "purchase_impact": o.purchase_impact,
-                "severity": o.severity,
-                "evidence_confidence": o.evidence_confidence,
-                "score": o.score,
-                "relevant_count": o.relevant_count,
-                "percentage": o.percentage,
-                "why_investigate": o.why_investigate,
-                "evidence_ids": _json_ids(o.evidence_ids_json),
-            }
-            for o in db.query(Opportunity).order_by(Opportunity.rank.asc()).all()
-        ]
+        themes = merge_category_rows(
+            [
+                {
+                    "name": t.name,
+                    "review_count": t.review_count,
+                    "evidence_ids": _json_ids(t.evidence_ids_json),
+                }
+                for t in db.query(Theme).order_by(Theme.review_count.desc()).all()
+            ],
+            label_keys=("name", "label"),
+            count_keys=("review_count", "count"),
+            id_keys=("evidence_ids", "review_ids"),
+        )
+        segments = merge_category_rows(
+            [
+                {
+                    "name": s.name,
+                    "review_count": s.review_count,
+                    "basis": s.basis,
+                    "evidence_ids": _json_ids(s.evidence_ids_json),
+                }
+                for s in db.query(Segment).order_by(Segment.review_count.desc()).all()
+            ],
+            label_keys=("name", "label"),
+            count_keys=("review_count", "count"),
+            id_keys=("evidence_ids", "review_ids"),
+        )
+        opps = merge_category_rows(
+            [
+                {
+                    "rank": o.rank,
+                    "name": o.name,
+                    "reach": o.reach,
+                    "frequency": o.frequency,
+                    "purchase_impact": o.purchase_impact,
+                    "severity": o.severity,
+                    "evidence_confidence": o.evidence_confidence,
+                    "score": o.score,
+                    "relevant_count": o.relevant_count,
+                    "percentage": o.percentage,
+                    "why_investigate": o.why_investigate,
+                    "evidence_ids": _json_ids(o.evidence_ids_json),
+                }
+                for o in db.query(Opportunity).order_by(Opportunity.rank.asc()).all()
+            ],
+            label_keys=("name", "label"),
+            count_keys=("relevant_count", "count"),
+            id_keys=("evidence_ids", "review_ids"),
+        )
         theme_momentum = label_window_momentum(
             db, "themes", since=since or get_last_30_days_cutoff(), source=src
         )
@@ -524,21 +554,26 @@ def _actions(ai_ok: bool) -> None:
 
 def _kpis(diag: dict, metrics: dict, opps: list, themes: list, period: str) -> None:
     top_score = opps[0]["score"] if opps else 0
+    available = int(diag.get("available_reviews") or diag.get("myntra_reviews") or diag.get("total_reviews") or 0)
+    selected = int(diag.get("selected_reviews") or min(available, int(diag.get("max_analysis_reviews") or 300)))
+    analyzed = int(diag.get("analyzed_reviews") or 0)
     cols = st.columns(5)
-    cols[0].metric("Total reviews", diag.get("total_reviews") or 0)
-    cols[1].metric("Dataset limit", _dataset_limit())
-    cols[2].metric("Google Play", diag.get("google_play_reviews") or 0)
-    cols[3].metric("Apple App Store", diag.get("apple_reviews") or 0)
-    cols[4].metric("Last 30 days", diag.get("last_30_day_reviews") or 0)
+    cols[0].metric("Reviews available", available)
+    cols[1].metric("Selected for analysis", selected)
+    cols[2].metric("Analyzed", analyzed)
+    cols[3].metric("Pending", diag.get("pending_reviews") or 0)
+    cols[4].metric("Failed", diag.get("failed_reviews") or 0)
     cols2 = st.columns(5)
-    cols2[0].metric("Analyzed", diag.get("analyzed_reviews") or 0)
-    cols2[1].metric("Pending", diag.get("pending_reviews") or 0)
-    cols2[2].metric("Failed", diag.get("failed_reviews") or 0)
+    cols2[0].metric("Google Play", diag.get("google_play_reviews") or 0)
+    cols2[1].metric("Apple App Store", diag.get("apple_reviews") or 0)
+    cols2[2].metric("Last 30 days", diag.get("last_30_day_reviews") or 0)
     cols2[3].metric("Wishlist-related", metrics.get("wishlist_signals") or 0)
     cols2[4].metric("Unique themes / top score", f"{len(themes)} / {top_score}")
     st.caption(
-        f"{diag.get('last_30_day_reviews') or 0} real reviews available in the last 30 days. "
-        f"Period filter: {period}. Counts come from the database, not the LLM."
+        f"Analysis based on {analyzed} public reviews"
+        f"{f' (selected {selected} of {available} stored)' if available else ''}. "
+        f"Period filter: {period}. This sample is not the entire Myntra customer base. "
+        "Counts come from the database, not the LLM."
     )
 
 
@@ -562,6 +597,22 @@ def _live_status(data: dict, diag: dict) -> None:
     b.metric("Last checked", humanize_ago(checked))
     c.metric("Pending analysis", diag.get("pending_reviews") or 0)
     d.metric("Failed analysis", diag.get("failed_reviews") or 0)
+    selected = int(diag.get("selected_reviews") or 0)
+    analyzed = int(diag.get("analyzed_reviews") or 0)
+    pending = int(diag.get("pending_reviews") or 0)
+    failed = int(diag.get("failed_reviews") or 0)
+    st.markdown("**AI ANALYSIS PROGRESS**")
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("Reviews selected", selected)
+    p2.metric("Analyzed", analyzed)
+    p3.metric("Pending", pending)
+    p4.metric("Failed", failed)
+    percent = int(round(100 * analyzed / selected)) if selected else 0
+    st.progress(min(100, max(0, percent)) / 100, text=f"Progress: {percent}%")
+    last = st.session_state.get("analysis_progress") or {}
+    if last.get("batch_index") and last.get("batch_total"):
+        st.caption(f"Current batch: {last.get('batch_index')} / {last.get('batch_total')}")
+    st.caption("Progress updates after each completed analysis batch. Not a live in-app event stream.")
     if diag.get("last_analysis_error"):
         st.error(diag.get("last_analysis_error"))
     daily = data.get("daily") or []
@@ -818,10 +869,12 @@ def _themes(data: dict, analyzed: int) -> None:
         daily_rows = []
         for m in data["theme_momentum"][:5]:
             for day, count in (m.get("by_day") or {}).items():
-                daily_rows.append({"day": day, "theme": m["label"][:24], "count": count})
+                daily_rows.append({"day": day, "theme": m["label"], "count": count})
         if daily_rows:
             st.caption("Theme mentions by review date")
-            st.bar_chart(pd.DataFrame(daily_rows), x="day", y="count", color="theme", height=240)
+            trend_df = trend_frame(daily_rows, label_key="theme")
+            if not trend_df.empty:
+                st.bar_chart(trend_df, x="day", y="count", color="theme", height=240)
     _insight(pm_insight(topic="theme", rows=[{"label": t["name"], "count": t["review_count"]} for t in themes], analyzed=analyzed))
     if themes:
         _view_evidence(themes[0].get("evidence_ids"), title="View supporting reviews")
@@ -1022,6 +1075,7 @@ def _decomposition(data: dict) -> None:
         barriers=data["barriers"][0]["count"] if data["barriers"] else 0,
         uncertainties=data["uncertainties"][0]["count"] if data["uncertainties"] else 0,
         abandoned=abandoned,
+        comparison=(data.get("compare") or [{}])[0].get("count", 0) if data.get("compare") else 0,
     )
     funnel = [
         {
@@ -1191,9 +1245,19 @@ def _evidence_explorer(source: str, rating: str, since, data: dict) -> None:
                     f"{review.source_url} · analysis={status}"
                 )
                 if review.analysis and review.analysis.is_valid_json:
-                    st.write("Problem:", review.analysis.root_cause or "—")
-                    st.write("Barriers:", review.analysis.barriers_json)
-                    st.write("Uncertainties:", review.analysis.uncertainties_json)
+                    st.write("Problem:", normalize_category_label(review.analysis.root_cause))
+                    barriers = []
+                    try:
+                        barriers = json.loads(review.analysis.barriers_json or "[]")
+                    except json.JSONDecodeError:
+                        barriers = []
+                    uncs = []
+                    try:
+                        uncs = json.loads(review.analysis.uncertainties_json or "[]")
+                    except json.JSONDecodeError:
+                        uncs = []
+                    st.write("Barriers:", ", ".join(normalize_label_list(barriers, keep_uncategorized_if_only_missing=False)) or "—")
+                    st.write("Uncertainties:", ", ".join(normalize_label_list(uncs, keep_uncategorized_if_only_missing=False)) or "—")
     finally:
         db.close()
 
@@ -1291,7 +1355,7 @@ def _pipeline_status_panel() -> None:
 
 def _run_full_discovery(ai_ok: bool) -> None:
     from app.collectors.engine import CollectionEngine
-    from app.pipeline.analysis import AnalysisRunResult, smoke_test_analyze_limit
+    from app.pipeline.analysis import AnalysisRunResult
     from app.pipeline.orchestrator import run_analysis_pipeline
 
     reload_settings()
@@ -1320,19 +1384,31 @@ def _run_full_discovery(ai_ok: bool) -> None:
                 st.error(result.last_error)
             else:
                 try:
-                    result = run_analysis_pipeline(db, analyze_limit=smoke_test_analyze_limit(db, settings))
+                    def _progress(event: dict) -> None:
+                        st.session_state["analysis_progress"] = event
+                        if event.get("batch_index"):
+                            box.write(
+                                f"Batch {event.get('batch_index')}/{event.get('batch_total')} · "
+                                f"analyzed {event.get('analyzed_total')} / selected {event.get('selected')} · "
+                                f"{event.get('percent')}%"
+                            )
+
+                    result = run_analysis_pipeline(db, progress=_progress)
                     steps["analyze"] = "done" if result.analyzed or not result.last_error else "failed"
                 except Exception as exc:
                     steps["analyze"] = "failed"
                     result.last_error = _openrouter_error(exc)
                     st.error(result.last_error)
-            steps["insights"] = "done" if result.analyzed else "failed"
+            steps["insights"] = "done" if result.analyzed or (get_database_diagnostics(db).get("analyzed_reviews") or 0) else "failed"
             steps["dashboard"] = "done"
             st.session_state["pipeline_steps"] = steps
             _load_bundle.clear()
             st.session_state["last_analysis"] = {
                 "status": "Connected" if result.analyzed else "Failed",
                 "message": result.last_error or f"Analyzed {result.analyzed}, failed {result.failed}.",
+                "batches_processed": result.batches_processed,
+                "successful_batches": result.successful_batches,
+                "failed_batches": result.failed_batches,
             }
             if result.last_error and not result.analyzed:
                 st.session_state["step4_error"] = {"error": result.last_error, "model": settings.resolved_model}
@@ -1368,7 +1444,6 @@ def _run_collect(sources: list[str], analyze: bool, mode: str = "latest") -> Non
 
 
 def _run_analyze(*, only_failed: bool = False) -> None:
-    from app.pipeline.analysis import smoke_test_analyze_limit
     from app.pipeline.orchestrator import run_analysis_pipeline
 
     reload_settings()
@@ -1377,9 +1452,12 @@ def _run_analyze(*, only_failed: bool = False) -> None:
         return
     db = _db()
     try:
+        def _progress(event: dict) -> None:
+            st.session_state["analysis_progress"] = event
+
         result = run_analysis_pipeline(
             db,
-            analyze_limit=smoke_test_analyze_limit(db, get_settings()),
+            progress=_progress,
             only_failed=only_failed,
             include_failed=only_failed,
         )
@@ -1388,6 +1466,9 @@ def _run_analyze(*, only_failed: bool = False) -> None:
         st.session_state["last_analysis"] = {
             "status": "Connected" if result.analyzed else "Configured",
             "message": result.last_error or f"Analyzed {result.analyzed}, failed {result.failed}.",
+            "batches_processed": result.batches_processed,
+            "successful_batches": result.successful_batches,
+            "failed_batches": result.failed_batches,
         }
         _load_bundle.clear()
     except Exception as exc:

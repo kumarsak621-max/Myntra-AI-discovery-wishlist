@@ -14,6 +14,7 @@ from collections import Counter, defaultdict
 from sqlalchemy.orm import Session
 
 from app.models import Review, Theme, utcnow
+from app.pipeline.labels import UNCATEGORIZED, normalize_category_label, normalize_label_list
 
 logger = logging.getLogger(__name__)
 
@@ -30,16 +31,38 @@ def _tokens(text: str) -> list[str]:
     return re.findall(r"[a-zA-Z]{3,}|\u0900-\u097F+", (text or "").lower())
 
 
+def _json_int_list(raw: str) -> list[int]:
+    out: list[int] = []
+    for item in _loads(raw):
+        try:
+            out.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def _label_bag(review: Review) -> list[str]:
     analysis = review.analysis
     if not analysis or not analysis.is_valid_json:
         return []
     labels = []
     for field in ("barriers_json", "uncertainties_json", "intent_json"):
-        labels.extend(str(x) for x in _loads(getattr(analysis, field)))
+        labels.extend(_loads(getattr(analysis, field)))
     if analysis.root_cause:
         labels.append(analysis.root_cause)
-    return [x.strip() for x in labels if str(x).strip()]
+    return normalize_label_list(labels, keep_uncategorized_if_only_missing=False)
+
+
+def _merge_theme(existing: Theme, *, review_count: int, myntra_n: int, ids: list[int], sources: set[str]) -> Theme:
+    existing.review_count = int(existing.review_count or 0) + review_count
+    existing.myntra_review_count = int(existing.myntra_review_count or 0) + myntra_n
+    existing.reference_review_count = existing.review_count - existing.myntra_review_count
+    merged_ids = list(dict.fromkeys(_json_int_list(existing.evidence_ids_json) + ids))[:80]
+    existing.evidence_ids_json = json.dumps(merged_ids)
+    merged_sources = set(_loads(existing.sources_json) if existing.sources_json else []) | set(sources)
+    existing.sources_json = json.dumps(sorted(str(s) for s in merged_sources))
+    existing.updated_at = utcnow()
+    return existing
 
 
 def discover_themes(db: Session) -> list[Theme]:
@@ -61,8 +84,9 @@ def discover_themes(db: Session) -> list[Theme]:
         sources: dict[str, set[str]] = defaultdict(set)
         myntra_c: Counter[str] = Counter()
         for review in analyzed:
-            for label in _label_bag(review):
-                key = label[:120]
+            bag = _label_bag(review) or [UNCATEGORIZED]
+            for label in bag:
+                key = normalize_category_label(label)[:120]
                 freq[key] += 1
                 owners[key].append(review.id)
                 sources[key].add(review.source)
@@ -71,7 +95,7 @@ def discover_themes(db: Session) -> list[Theme]:
         themes: list[Theme] = []
         for name, count in freq.most_common(20):
             theme = Theme(
-                name=name[:255],
+                name=normalize_category_label(name)[:255],
                 description="Emergent label cluster (small corpus — frequency grouping).",
                 cluster_key="label-freq",
                 review_count=count,
@@ -124,12 +148,13 @@ def discover_themes(db: Session) -> list[Theme]:
         ids: list[int] = []
         for review in members:
             for lab in _label_bag(review):
-                label_freq[lab[:120]] += 1
+                label_freq[normalize_category_label(lab)[:120]] += 1
             sources.add(review.source)
             ids.append(review.id)
             if review.is_valid_source:
                 myntra_n += 1
-        name = label_freq.most_common(1)[0][0] if label_freq else f"Cluster {cid + 1}"
+        raw_name = label_freq.most_common(1)[0][0] if label_freq else UNCATEGORIZED
+        name = normalize_category_label(raw_name)
         top_terms = []
         if len(order_centroids):
             top_terms = [str(terms[i]) for i in order_centroids[cid][:8]]
@@ -138,15 +163,18 @@ def discover_themes(db: Session) -> list[Theme]:
             if top_terms
             else "Emergent theme from label grouping."
         )
-        # Avoid duplicate names
-        existing_names = {t.name.lower() for t in themes}
-        final_name = name
-        suffix = 2
-        while final_name.lower() in existing_names:
-            final_name = f"{name} ({suffix})"
-            suffix += 1
+        existing = next((t for t in themes if t.name.lower() == name.lower()), None)
+        if existing is not None:
+            _merge_theme(
+                existing,
+                review_count=len(members),
+                myntra_n=myntra_n,
+                ids=ids,
+                sources=sources,
+            )
+            continue
         theme = Theme(
-            name=final_name[:255],
+            name=name[:255],
             description=description[:2000],
             cluster_key=str(cid),
             review_count=len(members),

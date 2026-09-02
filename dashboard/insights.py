@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.pipeline.labels import normalize_category_label
+
 
 def _n(value: Any, default: int = 0) -> int:
     try:
@@ -58,7 +60,7 @@ def why_this_matters(row: dict[str, Any], *, analyzed: int) -> str:
     """Grounded 'why this matters' copy for a single root-cause row."""
     if analyzed <= 0:
         return "Insufficient evidence for reliable root-cause analysis."
-    name = row.get("root_cause") or row.get("problem") or "this cause"
+    name = normalize_category_label(row.get("root_cause") or row.get("problem") or "this cause")
     count = _n(row.get("count") or row.get("frequency"))
     impact = row.get("purchase_impact")
     behavior = row.get("behavior") or ""
@@ -98,13 +100,19 @@ def funnel_stages(
     barriers: int,
     uncertainties: int,
     abandoned: int,
+    comparison: int = 0,
 ) -> list[dict[str, Any]]:
     """Behavioral decomposition counts. Missing stages stay at 0 instead of being invented."""
     return [
-        {"stage": "Wishlist language", "count": wishlist, "note": "Reviews mentioning save/wishlist/later"},
-        {"stage": "Purchase intent signals", "count": intent, "note": "intend_to_purchase / purchased"},
-        {"stage": "Information uncertainty", "count": uncertainties, "note": "Extracted uncertainties"},
-        {"stage": "Named purchase barriers", "count": barriers, "note": "Reviews with at least one extracted barrier"},
-        {"stage": "Purchase hesitation", "count": hesitation, "note": "purchase_hesitation explicit/implicit"},
-        {"stage": "Abandoned intent", "count": abandoned, "note": "purchase_signal = abandoned"},
+        {"stage": "Wishlist Intent", "count": wishlist, "note": "Reviews mentioning save/wishlist/later"},
+        {"stage": "Product Evaluation", "count": barriers, "note": "Named product evaluation barriers"},
+        {"stage": "Uncertainty Reduction", "count": uncertainties, "note": "Extracted uncertainties"},
+        {"stage": "Comparison", "count": comparison, "note": "Comparison behavior in this sample"},
+        {"stage": "Decision Confidence", "count": hesitation, "note": "purchase_hesitation explicit/implicit"},
+        {"stage": "Purchase Decision", "count": intent, "note": "intend_to_purchase / purchased"},
+        {
+            "stage": "Wishlist → Purchase (opportunity indicator)",
+            "count": abandoned,
+            "note": "Abandoned intent mentions — not an actual conversion rate",
+        },
     ]
