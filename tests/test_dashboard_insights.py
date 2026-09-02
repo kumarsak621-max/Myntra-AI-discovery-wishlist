@@ -35,7 +35,8 @@ def _review(db, source_id: str, text: str) -> Review:
             root_cause="size chart missing",
             barriers_json='["size"]',
             uncertainties_json='["Will it fit?"]',
-            intent_json='["wishlist"]',
+            wishlist_signal="implicit",
+            purchase_signal="none",
         )
     )
     db.commit()
@@ -88,9 +89,35 @@ def test_review_query_source_filter(db):
     assert len(apple) == 1
 
 
-def test_chat_insufficient_without_matches(db):
+def test_wishlist_intent_split_requires_explicit_evidence(db):
+    from app.pipeline.quantification import wishlist_intent_split
+
+    _review(db, "t-intent", "I will buy this after the sale.")
+    split = wishlist_intent_split(db)
+    labels = {r["label"] for r in split["rows"]}
+    assert "Occasion-driven shoppers" not in labels
+    assert all(r["count"] >= 1 for r in split["rows"])
+
+
+def test_root_cause_hierarchy_uses_review_ids(db):
+    from app.pipeline.quantification import root_cause_hierarchy
+
+    _review(db, "t-root", "Wishlisted this dress but the size chart is missing so I did not buy.")
+    rows = root_cause_hierarchy(db)
+    assert rows
+    assert rows[0]["root_cause"] == "size chart missing"
+    assert rows[0]["review_ids"]
+    assert rows[0]["count"] >= 1
+
+
+def test_discovery_questions_insufficient_without_analysis(db):
+    from dashboard.questions import answer_discovery_questions
+
+    cards = answer_discovery_questions(db, {"themes": [], "problems": []}, analyzed=0)
+    assert len(cards) == 10
+    assert all("insufficient" in c["answer"].lower() for c in cards)
     from dashboard.chat import ask_product_assistant
 
     result = ask_product_assistant(db, "What do Martian shoppers think?", analyzed=0)
-    assert "insufficient evidence" in result["answer"].lower()
+    assert "enough evidence" in result["answer"].lower() or "insufficient" in result["answer"].lower()
     assert result["supporting_review_count"] == 0

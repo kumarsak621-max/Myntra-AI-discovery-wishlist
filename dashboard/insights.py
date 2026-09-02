@@ -43,15 +43,32 @@ def pm_insight(
             f" The next most common signal is {second.get('label') or second.get('problem')} "
             f"({_n(second.get('count') or second.get('frequency'))} reviews)."
         )
-    implication = extra.strip() or (
+    extra = extra.strip() or (
         "This may affect decision confidence on the path from wishlist interest to purchase, "
         "but public reviews do not prove causality or the actual conversion rate."
     )
     return (
         f"{name} is the strongest {topic} in this sample, mentioned in {count} analyzed reviews{pct_text}. "
-        f"{follow} {implication} "
+        f"{follow} {extra} "
         f"A Product Manager should inspect the supporting reviews before treating this as a company-wide pattern."
     ).strip()
+
+
+def why_this_matters(row: dict[str, Any], *, analyzed: int) -> str:
+    """Grounded 'why this matters' copy for a single root-cause row."""
+    if analyzed <= 0:
+        return "Insufficient evidence for reliable root-cause analysis."
+    name = row.get("root_cause") or row.get("problem") or "this cause"
+    count = _n(row.get("count") or row.get("frequency"))
+    impact = row.get("purchase_impact")
+    behavior = row.get("behavior") or ""
+    return (
+        f"{name} is linked to {count} analyzed reviews in this sample"
+        f"{f' with purchase-impact {impact}/5' if impact is not None else ''}. "
+        f"{behavior + '. ' if behavior else ''}"
+        "This is a discovery signal from public reviews, not proof of the actual conversion rate. "
+        "A Product Manager should read the supporting reviews before prioritizing work."
+    )
 
 
 def wishlist_conversion_copy(signals: dict[str, Any]) -> str:

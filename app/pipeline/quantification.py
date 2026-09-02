@@ -717,3 +717,215 @@ def explicit_age_mentions(
         age = match.group(1) or match.group(2)
         hits.append({"review_id": review.id, "age": int(age), "quote": text[:240]})
     return hits
+
+
+SEGMENT_TERMS = {
+    "Price-sensitive shoppers": ("price", "expensive", "cheap", "value", "cost", "overpriced"),
+    "Fit-sensitive shoppers": ("size", "fit", "sizing", "chart"),
+    "Quality-conscious shoppers": ("quality", "fabric", "material", "durable"),
+    "Comparison shoppers": ("compar", "vs ", "versus", "alternative"),
+    "Occasion-driven shoppers": ("occasion", "wedding", "party", "festival", "event"),
+    "High-intent shoppers": ("will buy", "going to buy", "bought", "ordered", "purchased"),
+    "Uncertainty-driven shoppers": ("not sure", "confused", "uncertain", "doubt"),
+    "Bookmarking/save-for-later users": ("wishlist", "save for later", "bookmark", "later"),
+}
+
+PURCHASE_INTENT_TERMS = (
+    "will buy",
+    "going to buy",
+    "intend to buy",
+    "planning to buy",
+    "add to bag",
+    "added to bag",
+    "bought",
+    "purchased",
+    "ordered",
+)
+BOOKMARK_TERMS = (
+    "bookmark",
+    "save for later",
+    "saved for later",
+    "maybe later",
+    "not now",
+    "someday",
+)
+
+
+def _blob_has(blob: str, terms: tuple[str, ...]) -> bool:
+    return any(term in blob for term in terms)
+
+
+def rating_distribution(
+    db: Session, *, myntra_only: bool = True, since: datetime | None = None, source: str | None = None
+) -> list[dict[str, Any]]:
+    rows = review_query(db, myntra_only=myntra_only, since=since, source=source).all()
+    counts: Counter[str] = Counter()
+    for review in rows:
+        if review.rating is None:
+            continue
+        counts[str(int(review.rating))] += 1
+    total = sum(counts.values())
+    return [
+        {
+            "label": f"{star}★",
+            "count": counts.get(str(star), 0),
+            "percentage": pct(counts.get(str(star), 0), total),
+            "star": star,
+        }
+        for star in (1, 2, 3, 4, 5)
+        if counts.get(str(star), 0) > 0
+    ]
+
+
+def latest_review_cards(
+    db: Session,
+    *,
+    since: datetime | None = None,
+    source: str | None = None,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    rows = (
+        review_query(db, myntra_only=True, since=since, source=source)
+        .order_by(Review.review_date.desc())
+        .limit(limit)
+        .all()
+    )
+    cards = []
+    for review in rows:
+        analysis = review.analysis
+        cards.append(
+            {
+                "id": review.id,
+                "text": (review.text or review.title or "")[:400],
+                "rating": review.rating,
+                "source": review.source,
+                "region": review.region,
+                "date": review.review_date.isoformat() if review.review_date else None,
+                "source_review_id": review.source_review_id,
+                "status": getattr(analysis, "status", "none") if analysis else "none",
+            }
+        )
+    return cards
+
+
+def wishlist_intent_split(
+    db: Session, *, myntra_only: bool = True, since: datetime | None = None, source: str | None = None
+) -> dict[str, Any]:
+    """Exclusive buckets from explicit text + stored signals. Never assumes liking = intent."""
+    rows = [
+        r
+        for r in review_query(db, myntra_only=myntra_only, since=since, source=source).all()
+        if r.analysis and r.analysis.is_valid_json
+    ]
+    buckets = {
+        "Genuine Purchase Intent": [],
+        "Bookmarking / Save-for-later": [],
+        "Unclear Evidence": [],
+    }
+    for review in rows:
+        blob = _review_evidence_blob(review)
+        analysis = review.analysis
+        has_wishlist = analysis.wishlist_signal in {"explicit", "implicit"} or _blob_has(blob, BOOKMARK_TERMS)
+        if not has_wishlist:
+            continue
+        intent_hit = analysis.purchase_signal in {"purchased", "intend_to_purchase"} or _blob_has(
+            blob, PURCHASE_INTENT_TERMS
+        )
+        bookmark_hit = _blob_has(blob, BOOKMARK_TERMS)
+        if intent_hit and not bookmark_hit:
+            buckets["Genuine Purchase Intent"].append(review.id)
+        elif bookmark_hit and not intent_hit:
+            buckets["Bookmarking / Save-for-later"].append(review.id)
+        else:
+            buckets["Unclear Evidence"].append(review.id)
+    total = sum(len(v) for v in buckets.values())
+    rows_out = [
+        {
+            "label": name,
+            "count": len(ids),
+            "percentage": pct(len(ids), total),
+            "review_ids": ids[:50],
+        }
+        for name, ids in buckets.items()
+        if ids
+    ]
+    return {
+        "rows": rows_out,
+        "total": total,
+        "analyzed": len(rows),
+        "limited": total == 0,
+    }
+
+
+def root_cause_hierarchy(
+    db: Session, *, myntra_only: bool = True, since: datetime | None = None, source: str | None = None
+) -> list[dict[str, Any]]:
+    """Symptom → problem → root cause → behavior → impact → opportunity from stored analyses."""
+    from collections import Counter as Ctr
+
+    problems = problem_rows(db, myntra_only=myntra_only, since=since, source=source)
+    out = []
+    for item in problems:
+        ids = item.get("review_ids") or []
+        reviews = review_query(db, myntra_only=myntra_only, since=since, source=source).filter(Review.id.in_(ids)).all() if ids else []
+        barriers: Ctr[str] = Ctr()
+        uncertainties: Ctr[str] = Ctr()
+        seeking: Ctr[str] = Ctr()
+        hesitation = 0
+        for review in reviews:
+            analysis = review.analysis
+            if not analysis or not analysis.is_valid_json:
+                continue
+            for label in [str(x).strip() for x in _loads(analysis.barriers_json) if str(x).strip()]:
+                barriers[label] += 1
+            for label in [str(x).strip() for x in _loads(analysis.uncertainties_json) if str(x).strip()]:
+                uncertainties[label] += 1
+            for raw in _loads(analysis.information_seeking_json):
+                if isinstance(raw, dict) and raw.get("source"):
+                    seeking[str(raw.get("source"))] += 1
+            if analysis.purchase_hesitation in {"explicit", "implicit"}:
+                hesitation += 1
+        top_barrier = barriers.most_common(1)[0][0] if barriers else ""
+        top_unc = uncertainties.most_common(1)[0][0] if uncertainties else ""
+        top_seek = seeking.most_common(1)[0][0] if seeking else ""
+        if hesitation and item["frequency"]:
+            symptom = "Purchase hesitation mentioned in supporting reviews"
+        elif top_unc:
+            symptom = f"Remaining uncertainty recorded: {top_unc}"
+        else:
+            symptom = "Named user problem in public reviews"
+        if top_seek:
+            behavior = f"Information seeking ({top_seek})"
+        elif top_barrier:
+            behavior = f"Barrier mentioned: {top_barrier}"
+        elif top_unc:
+            behavior = f"Users still asking about: {top_unc}"
+        else:
+            behavior = "No additional behavioral label extracted"
+        impact = item["purchase_impact"]
+        if impact >= 4:
+            business = "High purchase-impact signal in this sample"
+        elif impact >= 3:
+            business = "Moderate purchase-impact signal in this sample"
+        else:
+            business = "Lower purchase-impact signal in this sample — inspect evidence before generalizing"
+        opportunity = f"Investigate decision confidence around: {item['problem']}"
+        out.append(
+            {
+                "root_cause": item["problem"],
+                "symptom": symptom,
+                "problem": item["problem"],
+                "behavior": behavior,
+                "business_impact": business,
+                "opportunity": opportunity,
+                "count": item["frequency"],
+                "percentage": item["percentage"],
+                "severity": item["severity"],
+                "purchase_impact": item["purchase_impact"],
+                "confidence": item.get("confidence"),
+                "review_ids": ids,
+                "top_barrier": top_barrier,
+                "top_uncertainty": top_unc,
+            }
+        )
+    return out

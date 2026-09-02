@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import streamlit as st
@@ -19,25 +20,31 @@ from app.database import (
     migrate_schema,
 )
 from app.models import CollectionRun, Opportunity, Review, Segment, Theme
-from app.pipeline.dates import get_last_30_days_cutoff, humanize_ago
+from app.pipeline.dates import ensure_aware, get_last_30_days_cutoff, humanize_ago, utcnow
 from app.pipeline.quantification import (
     BARRIER_TERMS,
     COMPARISON_METHOD_TERMS,
     COMPARISON_TERMS,
     EXTERNAL_TERMS,
+    SEGMENT_TERMS,
     SOCIAL_TERMS,
     UNCERTAINTY_TERMS,
     WISHLIST_BEHAVIOR_TERMS,
     PURCHASE_BEHAVIOR_TERMS,
+    daily_review_trends,
     explicit_age_mentions,
     label_distribution,
     label_window_momentum,
+    latest_review_cards,
     overview_metrics,
     problem_rows,
     purchase_signal_counts,
+    rating_distribution,
+    root_cause_hierarchy,
     signal_counts,
     source_live_status,
     taxonomy_counts,
+    wishlist_intent_split,
 )
 from app.pipeline.report import build_report, evidence_cards
 from config.settings import (
@@ -46,25 +53,20 @@ from config.settings import (
     get_settings,
     reload_settings,
 )
+from dashboard.charts import bar_chart, donut_chart, heatmap_impact_frequency, scatter_chart
 from dashboard.chat import ask_product_assistant
-from dashboard.insights import funnel_stages, pm_insight, wishlist_conversion_copy
+from dashboard.insights import funnel_stages, pm_insight, why_this_matters, wishlist_conversion_copy
+from dashboard.questions import DISCOVERY_QUESTIONS, answer_discovery_questions
 
 LOGGER = logging.getLogger("myntra.discovery")
 
 EMPTY = "No real reviews have been collected yet."
 NEAR_REALTIME = "Near-real-time — refreshed from public sources"
+AUTO_REFRESH_INTERVAL = timedelta(minutes=5)
+AUTO_REFRESH_SECONDS = int(AUTO_REFRESH_INTERVAL.total_seconds())
+INSUFFICIENT_ROOT = "Insufficient real evidence for this analysis."
 
-SUGGESTED_QUESTIONS = [
-    "Why do users add fashion products to their wishlist?",
-    "What prevents wishlisted products from eventually being purchased?",
-    "What uncertainties remain after users identify a product?",
-    "What causes users to postpone a purchase?",
-    "How do users compare multiple shortlisted products?",
-    "What information do users seek outside Myntra before purchasing?",
-    "What role do fit, size, styling, price, reviews, occasion and social validation play?",
-    "When is wishlist behavior genuine purchase intent versus bookmarking?",
-    "How do these behaviors differ across user segments?",
-    "What unmet needs emerge consistently?",
+SUGGESTED_QUESTIONS = list(DISCOVERY_QUESTIONS) + [
     "What is the highest-impact opportunity?",
     "Which problem has the strongest evidence?",
     "Show me evidence for size uncertainty.",
@@ -154,17 +156,11 @@ def _bar(df: pd.DataFrame, *, empty: str = "Insufficient evidence for this visua
     if df is None or df.empty:
         st.info(empty)
         return
-    try:
-        st.bar_chart(df, x="label", y="count", horizontal=True, height=260)
-    except TypeError:
-        st.bar_chart(df.set_index("label")["count"], height=260)
+    bar_chart(df.to_dict("records"), empty=empty)
 
 
 def _scatter(df: pd.DataFrame) -> None:
-    if df is None or df.empty:
-        st.info("Insufficient evidence for this visualization.")
-        return
-    st.scatter_chart(df, x="frequency", y="impact", size="count", height=260)
+    scatter_chart(df.to_dict("records") if df is not None and not df.empty else [])
 
 
 def _insight(text: str) -> None:
@@ -182,6 +178,70 @@ def _quotes(cards: list[dict]) -> None:
             f'{card.get("date") or "—"} · {card.get("region") or "—"} · id {card.get("source_review_id")}</small></div>',
             unsafe_allow_html=True,
         )
+
+
+def _view_evidence(review_ids: list[int] | None, *, title: str = "View supporting reviews") -> None:
+    ids = [int(i) for i in (review_ids or [])]
+    if not ids:
+        return
+    with st.expander(f"{title} ({len(ids)} ids)"):
+        st.caption("Review IDs: " + ", ".join(str(i) for i in ids[:30]))
+        db = _db()
+        try:
+            _quotes(evidence_cards(db, ids, limit=8))
+        finally:
+            db.close()
+
+
+def _seconds_since_last_collection() -> float | None:
+    db = _db()
+    try:
+        last = (
+            db.query(CollectionRun)
+            .filter(CollectionRun.status.in_(["completed", "completed_with_errors"]))
+            .order_by(CollectionRun.id.desc())
+            .first()
+        )
+        if not last or not last.finished_at:
+            return None
+        stamp = ensure_aware(last.finished_at)
+        if stamp is None:
+            return None
+        return (utcnow() - stamp).total_seconds()
+    finally:
+        db.close()
+
+
+def _try_auto_collect() -> None:
+    """Collect latest reviews at most once per AUTO_REFRESH_INTERVAL. Never re-analyzes history."""
+    last_attempt = float(st.session_state.get("_auto_collect_attempt") or 0)
+    if last_attempt and (time.time() - last_attempt) < AUTO_REFRESH_SECONDS:
+        return
+    elapsed = _seconds_since_last_collection()
+    if elapsed is not None and elapsed < AUTO_REFRESH_SECONDS:
+        return
+    st.session_state["_auto_collect_attempt"] = time.time()
+    _run_collect(["google_play", "apple_app_store"], analyze=False, mode="latest")
+
+
+def _auto_refresh_fragment() -> None:
+    st.caption(
+        f"{NEAR_REALTIME}. Automatic source check every 5 minutes. "
+        "This is not real-time streaming."
+    )
+    now = time.time()
+    if "_page_started_at" not in st.session_state:
+        st.session_state["_page_started_at"] = now
+        return
+    if now - float(st.session_state["_page_started_at"]) < AUTO_REFRESH_SECONDS:
+        return
+    _try_auto_collect()
+
+
+if hasattr(st, "fragment"):
+    _auto_sync_ui = st.fragment(run_every="5m")(_auto_refresh_fragment)
+else:
+    _auto_sync_ui = _auto_refresh_fragment
 
 
 def _source_key(source: str) -> str | None:
@@ -241,6 +301,12 @@ def _load_bundle(since_iso: str | None, source: str, cache_token: str) -> dict:
         social = taxonomy_counts(db, SOCIAL_TERMS, since=since, source=src)
         purchase_beh = taxonomy_counts(db, PURCHASE_BEHAVIOR_TERMS, since=since, source=src)
         purchase_signals = purchase_signal_counts(db, since=since, source=src)
+        root_causes = root_cause_hierarchy(db, since=since, source=src)
+        wishlist_intent = wishlist_intent_split(db, since=since, source=src)
+        segment_tax = taxonomy_counts(db, SEGMENT_TERMS, since=since, source=src)
+        ratings = rating_distribution(db, since=since, source=src)
+        latest = latest_review_cards(db, since=since, source=src, limit=8)
+        daily = daily_review_trends(db, myntra_only=True, since=since)
         themes = [
             {
                 "name": t.name,
@@ -300,6 +366,12 @@ def _load_bundle(since_iso: str | None, source: str, cache_token: str) -> dict:
             "social": social,
             "purchase_beh": purchase_beh,
             "purchase_signals": purchase_signals,
+            "root_causes": root_causes,
+            "wishlist_intent": wishlist_intent,
+            "segment_tax": segment_tax,
+            "ratings": ratings,
+            "latest": latest,
+            "daily": daily,
             "themes": themes,
             "segments": segments,
             "opps": opps,
@@ -325,21 +397,31 @@ def render() -> None:
     settings = get_settings()
     cfg = get_ai_config()
     ai_ok = settings.has_ai_credentials
+    source = "All"
 
     with st.sidebar:
-        st.markdown("**Controls**")
-        period = st.radio("Date range", ["Last 30 Days", "All Time"], index=0)
+        st.markdown("**Myntra AI Discovery Engine**")
+        period = st.selectbox("Period", ["Last 30 Days", "All Time"], index=0)
         st.session_state["period"] = period
-        source = st.selectbox("Source", ["All", "Google Play", "Apple App Store"])
-        rating = st.selectbox("Rating filter", ["All", "1", "2", "3", "4", "5"])
-        auto = st.selectbox("Auto-refresh", ["OFF", "5 minutes", "15 minutes"], index=0)
-        st.session_state["analyze_on_collect"] = st.checkbox("Analyze after refresh", value=ai_ok and True)
-        st.caption(f"Dataset limit: {_dataset_limit()} (maximum)")
-        st.caption("API key is never displayed.")
-        if st.button("Analyze pending"):
-            _run_analyze()
-        if st.button("Retry failed analysis"):
-            _run_analyze(only_failed=True)
+        if st.button("🔄 Refresh Latest Reviews"):
+            _run_collect(["google_play", "apple_app_store"], analyze=False, mode="latest")
+        st.session_state["analyze_on_collect"] = False
+        diag_side = get_database_diagnostics()
+        freshness_side = _seconds_since_last_collection()
+        last_checked = "never"
+        if freshness_side is not None:
+            last_checked = humanize_ago(utcnow() - timedelta(seconds=freshness_side))
+        st.caption(f"Last checked: {last_checked}")
+        st.caption(f"Reviews: {diag_side.get('total_reviews') or 0}")
+        st.caption(f"Analyzed: {diag_side.get('analyzed_reviews') or 0}")
+        st.caption(NEAR_REALTIME)
+        with st.expander("More"):
+            if st.button("Analyze pending"):
+                _run_analyze()
+            if st.button("Retry failed analysis"):
+                _run_analyze(only_failed=True)
+            st.caption(f"Dataset limit: {_dataset_limit()} (maximum)")
+            st.caption("API key is never displayed.")
 
     since = _period_since()
     cache_token = f"{_cache_token()}:{source}:{period}"
@@ -360,35 +442,34 @@ def render() -> None:
     _header(cfg, data["freshness"], period)
     _actions(ai_ok)
     _pipeline_status_panel()
-    _kpis(diag, metrics, data["opps"], data["themes"], period)
-    _wishlist_indicator(data["signals"], data["barriers"])
+    _auto_sync_ui()
 
     if stored == 0:
         st.info(EMPTY)
+        _limitations()
         return
     if blocker and analyzed == 0:
         st.warning(blocker)
 
+    _overview(diag, metrics, data, period)
+    _live_status(data, diag)
+    _latest_reviews(data)
     _problems(data, analyzed)
+    _root_causes(data, analyzed)
     _wishlist(data, analyzed)
     _barriers(data, analyzed)
     _uncertainties(data, analyzed)
     _themes(data, analyzed)
     _segments(data, analyzed)
-    _purchase_behavior(data, analyzed)
     _comparison(data, analyzed)
     _external(data, analyzed)
-    _social(data, analyzed)
     _opportunities(data, analyzed)
     _decomposition(data)
-    _discovery_report(data, analyzed)
-    _evidence_explorer(source, rating, since, data)
+    _discovery_questions(data, analyzed)
     _chatbot(analyzed)
-    _limitations()
+    _evidence_explorer("All", "All", since, data)
     _collection_history()
-
-    if auto != "OFF":
-        st.caption("Auto-refresh polls public feeds periodically. It is not a live event stream.")
+    _limitations()
 
 
 def _header(cfg: dict, freshness: dict, period: str) -> None:
@@ -461,6 +542,83 @@ def _kpis(diag: dict, metrics: dict, opps: list, themes: list, period: str) -> N
     )
 
 
+def _overview(diag: dict, metrics: dict, data: dict, period: str) -> None:
+    st.markdown('<div class="section-h">1. OVERVIEW</div>', unsafe_allow_html=True)
+    _kpis(diag, metrics, data["opps"], data["themes"], period)
+    left, right = st.columns(2)
+    with left:
+        st.caption("Review rating distribution")
+        donut_chart(data.get("ratings") or [])
+    with right:
+        _wishlist_indicator(data["signals"], data["barriers"])
+
+
+def _live_status(data: dict, diag: dict) -> None:
+    st.markdown('<div class="section-h">2. LIVE DATA STATUS</div>', unsafe_allow_html=True)
+    raw = (data.get("freshness") or {}).get("last_checked")
+    checked = datetime.fromisoformat(raw) if raw else None
+    a, b, c, d = st.columns(4)
+    a.metric("Status", NEAR_REALTIME)
+    b.metric("Last checked", humanize_ago(checked))
+    c.metric("Pending analysis", diag.get("pending_reviews") or 0)
+    d.metric("Failed analysis", diag.get("failed_reviews") or 0)
+    if diag.get("last_analysis_error"):
+        st.error(diag.get("last_analysis_error"))
+    daily = data.get("daily") or []
+    if daily:
+        st.caption("Reviews by day (review timestamps, not collection time)")
+        st.bar_chart(pd.DataFrame(daily), x="day", y="reviews", height=220)
+    else:
+        st.info("Insufficient evidence for this visualization.")
+    st.caption("Never a live stream of in-app events. Sources are checked at most every 5 minutes.")
+
+
+def _latest_reviews(data: dict) -> None:
+    st.markdown('<div class="section-h">3. LATEST REVIEWS</div>', unsafe_allow_html=True)
+    rows = data.get("latest") or []
+    if not rows:
+        st.info("No real reviews have been collected yet.")
+        return
+    for row in rows:
+        with st.expander(f"{row.get('source')} · {row.get('rating')}★ · {row.get('status')} · {row.get('date')}"):
+            st.write(row.get("text") or "")
+            st.caption(
+                f"id {row.get('source_review_id')} · region {row.get('region') or '—'} · review_id {row.get('id')}"
+            )
+
+
+def _root_causes(data: dict, analyzed: int) -> None:
+    st.markdown('<div class="section-h">5. ROOT CAUSE ANALYSIS</div>', unsafe_allow_html=True)
+    st.caption("Hierarchy from stored analyses: symptom → problem → root cause → behavior → business impact → opportunity.")
+    rows = data.get("root_causes") or []
+    if not rows:
+        st.info(INSUFFICIENT_ROOT)
+        _insight(pm_insight(topic="root cause", rows=[], analyzed=analyzed))
+        return
+    left, mid, right = st.columns(3)
+    with left:
+        bar_chart([{"label": r["root_cause"], "count": r["count"]} for r in rows[:8]])
+    with mid:
+        donut_chart([{"label": r["root_cause"], "count": r["count"]} for r in rows[:8]])
+    with right:
+        scatter_chart(
+            [{"frequency": r["count"], "impact": r["purchase_impact"], "count": r["count"]} for r in rows[:12]]
+        )
+    for i, row in enumerate(rows[:6], 1):
+        st.markdown(
+            f"**{i}. {row['root_cause']}**  \n"
+            f"Evidence {row['count']} · {row['percentage']}% · "
+            f"Severity {row['severity']}/5 · Purchase impact {row['purchase_impact']}/5"
+        )
+        st.caption(
+            f"Symptom: {row['symptom']} → Problem: {row['problem']} → "
+            f"Behavior: {row['behavior']} → Impact: {row['business_impact']} → "
+            f"Opportunity: {row['opportunity']}"
+        )
+        _insight(why_this_matters(row, analyzed=analyzed))
+        _view_evidence(row.get("review_ids"), title="View supporting reviews")
+
+
 def _wishlist_indicator(signals: dict, barriers: list) -> None:
     st.markdown('<div class="section-h">WISHLIST → PURCHASE</div>', unsafe_allow_html=True)
     st.caption("Evidence-based opportunity indicator — not an actual Myntra conversion rate.")
@@ -478,108 +636,126 @@ def _wishlist_indicator(signals: dict, barriers: list) -> None:
 
 
 def _problems(data: dict, analyzed: int) -> None:
-    st.markdown('<div class="section-h">1. USER PROBLEMS</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-h">4. USER PROBLEMS</div>', unsafe_allow_html=True)
     rows = data["problems"]
     if not rows:
         st.info("Insufficient evidence for this visualization." if analyzed else "No analyzed reviews yet.")
         _insight(pm_insight(topic="user problem", rows=[], analyzed=analyzed))
         return
+    if len(rows) < 4:
+        st.caption(
+            f"Only {len(rows)} evidence-supported problem(s) in this sample. "
+            "Additional problems are not invented to fill the layout."
+        )
     shown = rows[:6]
     left, mid, right = st.columns([1.2, 1, 1])
     with left:
         for i, row in enumerate(shown, 1):
             st.markdown(
                 f"**{i}. {row['problem']}**  \n"
-                f"{row['frequency']} reviews · {row['percentage']}%  \n"
+                f"{row['frequency']} reviews · {row['percentage']}% of relevant  \n"
                 f"Severity {row['severity']}/5 · Purchase impact {row['purchase_impact']}/5 · "
-                f"Confidence {row.get('confidence') or '—'}"
+                f"Root cause: {row['problem']}"
             )
+            _view_evidence(row.get("review_ids"), title="View supporting reviews")
     with mid:
-        _bar(pd.DataFrame([{"label": r["problem"][:40], "count": r["frequency"]} for r in shown]))
+        bar_chart([{"label": r["problem"], "count": r["frequency"]} for r in shown])
     with right:
-        _scatter(
-            pd.DataFrame(
-                [
-                    {
-                        "frequency": r["frequency"],
-                        "impact": r["purchase_impact"],
-                        "count": r["frequency"],
-                    }
-                    for r in shown
-                ]
-            )
+        donut_chart([{"label": r["problem"], "count": r["frequency"]} for r in shown])
+    scatter_chart(
+        [{"frequency": r["frequency"], "impact": r["purchase_impact"], "count": r["frequency"]} for r in shown]
+    )
+    _insight(
+        pm_insight(
+            topic="user problem",
+            rows=[{"label": r["problem"], "count": r["frequency"], "percentage": r["percentage"]} for r in shown],
+            analyzed=analyzed,
         )
-    _insight(pm_insight(topic="user problem", rows=[{"label": r["problem"], "count": r["frequency"], "percentage": r["percentage"]} for r in shown], analyzed=analyzed))
-    db = _db()
-    try:
-        _quotes(evidence_cards(db, shown[0].get("review_ids") or [], limit=3))
-    finally:
-        db.close()
+    )
 
 
 def _wishlist(data: dict, analyzed: int) -> None:
-    st.markdown('<div class="section-h">2. WISHLIST BEHAVIOR</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-h">6. WISHLIST BEHAVIOR</div>', unsafe_allow_html=True)
     rows = data["wishlist_beh"] or data["intents"]
-    if not rows:
+    split = data.get("wishlist_intent") or {}
+    split_rows = split.get("rows") or []
+    if split.get("limited") or not split_rows:
+        st.info(
+            "Public reviews contain limited direct evidence about wishlist "
+            "behavior. This cannot be used to calculate actual wishlist conversion."
+        )
+    if not rows and not split_rows:
         st.info("Insufficient evidence for this visualization.")
         _insight(pm_insight(topic="wishlist behavior", rows=[], analyzed=analyzed))
         return
     left, right = st.columns(2)
     with left:
-        _bar(pd.DataFrame([{"label": r["label"][:40], "count": r["count"]} for r in rows[:8]]))
+        bar_chart(rows[:8] if rows else split_rows)
     with right:
-        intent = next((r for r in rows if "intent" in r["label"].lower() or "purchase" in r["label"].lower()), None)
-        bookmark = next((r for r in rows if "bookmark" in r["label"].lower() or "save" in r["label"].lower()), None)
-        donut = []
-        if intent:
-            donut.append({"label": intent["label"], "count": intent["count"]})
-        if bookmark:
-            donut.append({"label": bookmark["label"], "count": bookmark["count"]})
-        if donut:
-            _bar(pd.DataFrame(donut))
-        else:
-            st.info("Insufficient evidence to split purchase intent vs bookmarking.")
+        st.caption("WISHLIST INTENT — purchase intent vs bookmarking vs unclear")
+        donut_chart(split_rows)
+        if split_rows:
+            st.dataframe(
+                [{"bucket": r["label"], "frequency": r["count"], "percentage": r["percentage"]} for r in split_rows],
+                hide_index=True,
+                width="stretch",
+            )
+    if rows:
         st.dataframe(
             [{"behavior": r["label"], "frequency": r["count"], "percentage": r["percentage"]} for r in rows[:10]],
             hide_index=True,
             width="stretch",
         )
-    _insight(pm_insight(topic="wishlist behavior", rows=rows, analyzed=analyzed, extra="Wishlist language in public reviews can mean delayed purchase, price watching, or bookmarking — not a completed conversion."))
-    db = _db()
-    try:
-        st.caption("Wishlist quotes — copied from stored review text.")
-        _quotes(evidence_cards(db, rows[0].get("review_ids") or [], limit=3))
-    finally:
-        db.close()
+        _view_evidence(rows[0].get("review_ids"), title="View supporting reviews")
+    _insight(
+        pm_insight(
+            topic="wishlist behavior",
+            rows=rows or split_rows,
+            analyzed=analyzed,
+            extra="Wishlist language in public reviews can mean delayed purchase, price watching, or bookmarking — not a completed conversion.",
+        )
+    )
+    purchase_beh = data.get("purchase_beh") or []
+    if purchase_beh:
+        st.caption("Purchasing & decision behavior (evidence-supported only)")
+        bar_chart(purchase_beh)
 
 
 def _barriers(data: dict, analyzed: int) -> None:
-    st.markdown('<div class="section-h">3. PURCHASE BARRIERS</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-h">7. PURCHASE BARRIERS</div>', unsafe_allow_html=True)
     rows = data["barriers"] or data["barrier_tax"]
     if not rows:
         st.info("Insufficient evidence for this visualization.")
         _insight(pm_insight(topic="purchase barrier", rows=[], analyzed=analyzed))
         return
-    left, right = st.columns(2)
+    from app.pipeline.scoring import purchase_impact_from_hesitation
+
+    for row in rows:
+        if row.get("purchase_impact") is None:
+            row["purchase_impact"] = purchase_impact_from_hesitation(
+                int(row.get("hesitant_count") or 0), int(row.get("count") or 0)
+            )
+    if len(rows) < 4:
+        st.caption(f"Only {len(rows)} evidence-supported barrier(s). Extra barriers are not fabricated.")
+    shown = rows[:8]
+    left, mid, right = st.columns(3)
     with left:
-        _bar(pd.DataFrame([{"label": r["label"][:40], "count": r["count"]} for r in rows[:8]]))
+        bar_chart(shown)
+    with mid:
+        donut_chart(shown)
     with right:
-        heat = pd.DataFrame(
-            [
-                {
-                    "barrier": r["label"][:32],
-                    "frequency": r["count"],
-                    "hesitation": r.get("hesitant_count") or 0,
-                }
-                for r in rows[:8]
-            ]
+        heatmap_impact_frequency(shown)
+    for row in shown[:6]:
+        st.markdown(
+            f"**{row['label']}** — {row['count']} reviews ({row['percentage']}%) · "
+            f"hesitation mentions {row.get('hesitant_count') or 0}"
         )
-        st.dataframe(heat, hide_index=True, width="stretch")
+        _view_evidence(row.get("review_ids"), title="View supporting reviews")
     _insight(pm_insight(topic="purchase barrier", rows=rows, analyzed=analyzed))
 
 
 def _uncertainties(data: dict, analyzed: int) -> None:
-    st.markdown('<div class="section-h">4. PURCHASE UNCERTAINTIES</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-h">8. UNCERTAINTIES</div>', unsafe_allow_html=True)
     rows = data["uncertainties"] or data["unc_tax"]
     if not rows:
         st.info("Insufficient evidence for this visualization.")
@@ -587,24 +763,28 @@ def _uncertainties(data: dict, analyzed: int) -> None:
         return
     left, right = st.columns(2)
     with left:
-        _bar(pd.DataFrame([{"label": r["label"][:40], "count": r["count"]} for r in rows[:8]]))
+        bar_chart(rows[:10])
     with right:
-        st.dataframe(
-            [{"uncertainty": r["label"], "frequency": r["count"], "percentage": r["percentage"]} for r in rows[:10]],
-            hide_index=True,
-            width="stretch",
-        )
+        donut_chart(rows[:10])
+    st.dataframe(
+        [
+            {
+                "uncertainty": r["label"],
+                "frequency": r["count"],
+                "percentage": r["percentage"],
+                "impact": r.get("hesitant_count") or 0,
+            }
+            for r in rows[:12]
+        ],
+        hide_index=True,
+        width="stretch",
+    )
     _insight(pm_insight(topic="purchase uncertainty", rows=rows, analyzed=analyzed))
-    db = _db()
-    try:
-        st.caption("Top uncertainty quotes — copied from stored review text.")
-        _quotes(evidence_cards(db, rows[0].get("review_ids") or [], limit=4))
-    finally:
-        db.close()
+    _view_evidence(rows[0].get("review_ids"), title="View supporting reviews")
 
 
 def _themes(data: dict, analyzed: int) -> None:
-    st.markdown('<div class="section-h">5. KEY THEMES</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-h">9. THEMES</div>', unsafe_allow_html=True)
     themes = data["themes"]
     momentum = {m["label"]: m for m in data["theme_momentum"]}
     if not themes:
@@ -614,40 +794,85 @@ def _themes(data: dict, analyzed: int) -> None:
     for i, theme in enumerate(themes[:4]):
         trend = (momentum.get(theme["name"]) or {}).get("momentum") or "insufficient data"
         cards[i].metric(theme["name"][:40], f"{theme['review_count']} reviews")
-        cards[i].caption(f"Trend: {trend}")
-    _bar(pd.DataFrame([{"label": t["name"][:40], "count": t["review_count"]} for t in themes[:10]]))
+        cards[i].caption(f"Trend: {trend} (descriptive split, not a significance test)")
+    left, right = st.columns(2)
+    with left:
+        bar_chart([{"label": t["name"], "count": t["review_count"]} for t in themes[:10]])
+    with right:
+        donut_chart([{"label": t["name"], "count": t["review_count"]} for t in themes[:10]])
     if data["theme_momentum"]:
         st.dataframe(
-            [{"theme": m["label"], "count": m["count"], "trend": m["momentum"]} for m in data["theme_momentum"][:10]],
+            [
+                {
+                    "theme": m["label"],
+                    "count": m["count"],
+                    "trend": m["momentum"],
+                    "root_cause": m["label"],
+                    "business_impact": "Inspect supporting reviews — public data does not prove conversion impact.",
+                }
+                for m in data["theme_momentum"][:10]
+            ],
             hide_index=True,
             width="stretch",
         )
+        daily_rows = []
+        for m in data["theme_momentum"][:5]:
+            for day, count in (m.get("by_day") or {}).items():
+                daily_rows.append({"day": day, "theme": m["label"][:24], "count": count})
+        if daily_rows:
+            st.caption("Theme mentions by review date")
+            st.bar_chart(pd.DataFrame(daily_rows), x="day", y="count", color="theme", height=240)
     _insight(pm_insight(topic="theme", rows=[{"label": t["name"], "count": t["review_count"]} for t in themes], analyzed=analyzed))
+    if themes:
+        _view_evidence(themes[0].get("evidence_ids"), title="View supporting reviews")
 
 
 def _segments(data: dict, analyzed: int) -> None:
-    st.markdown('<div class="section-h">6. USER SEGMENTS</div>', unsafe_allow_html=True)
-    segs = data["segments"]
+    st.markdown('<div class="section-h">10. USER SEGMENTS</div>', unsafe_allow_html=True)
+    st.info("Age is not directly observable from public reviews. Demographic information is not available from the public review dataset.")
+    segs = data["segments"] or [
+        {"name": r["label"], "review_count": r["count"], "basis": "Evidence-based inferred segment", "evidence_ids": r.get("review_ids") or []}
+        for r in (data.get("segment_tax") or [])
+    ]
     if not segs:
         st.info("Insufficient evidence for reliable segmentation.")
     else:
+        relevant = max(analyzed, 1)
         left, right = st.columns(2)
         with left:
-            _bar(pd.DataFrame([{"label": s["name"][:40], "count": s["review_count"]} for s in segs[:8]]))
+            donut_chart([{"label": s["name"], "count": s["review_count"]} for s in segs[:8]])
         with right:
-            st.dataframe(
-                [{"segment": s["name"], "reviews": s["review_count"], "basis": s["basis"]} for s in segs],
-                hide_index=True,
-                width="stretch",
+            bar_chart([{"label": s["name"], "count": s["review_count"]} for s in segs[:8]])
+        table = []
+        problems = data.get("problems") or []
+        barriers = data.get("barriers") or data.get("barrier_tax") or []
+        roots = data.get("root_causes") or []
+        for s in segs:
+            table.append(
+                {
+                    "segment": s["name"],
+                    "evidence": s["review_count"],
+                    "pct_analyzed": round(100 * s["review_count"] / relevant, 2) if analyzed else 0,
+                    "key_behavior": "Evidence-based inferred segment",
+                    "primary_problem": problems[0]["problem"] if problems else "—",
+                    "purchase_barrier": barriers[0]["label"] if barriers else "—",
+                    "root_cause": roots[0]["root_cause"] if roots else "—",
+                    "opportunity": (data["opps"][0]["name"] if data.get("opps") else "—"),
+                }
             )
-        _insight(pm_insight(topic="behavioral segment", rows=[{"label": s["name"], "count": s["review_count"]} for s in segs], analyzed=analyzed))
-    if data["ages"]:
-        st.caption(f"Explicit age evidence: {len(data['ages'])} reviews mention an age number.")
-    else:
-        st.info(
-            "Age segmentation is not reliably available from public review data. "
-            "Behavioral segmentation is used instead. Age data unavailable from public review evidence."
+        st.dataframe(table, hide_index=True, width="stretch")
+        _insight(
+            pm_insight(
+                topic="behavioral segment",
+                rows=[{"label": s["name"], "count": s["review_count"]} for s in segs],
+                analyzed=analyzed,
+            )
         )
+        _view_evidence(segs[0].get("evidence_ids"), title="View supporting reviews")
+    if data["ages"]:
+        st.caption(f"Explicit age evidence: {len(data['ages'])} reviews mention an age number. Survey-derived demographic data is not connected.")
+    else:
+        st.caption("No survey-derived demographic data is connected to this application.")
 
 
 def _purchase_behavior(data: dict, analyzed: int) -> None:
@@ -667,7 +892,7 @@ def _purchase_behavior(data: dict, analyzed: int) -> None:
 
 
 def _comparison(data: dict, analyzed: int) -> None:
-    st.markdown('<div class="section-h">8. HOW USERS COMPARE PRODUCTS</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-h">11. COMPARISON BEHAVIOR</div>', unsafe_allow_html=True)
     rows = data["compare"]
     methods = data["compare_how"]
     if not rows and not methods:
@@ -676,24 +901,45 @@ def _comparison(data: dict, analyzed: int) -> None:
         return
     left, right = st.columns(2)
     with left:
-        _bar(pd.DataFrame([{"label": r["label"], "count": r["count"]} for r in rows[:8]]) if rows else None)
+        bar_chart(rows[:8] if rows else None)
     with right:
         if methods:
             st.caption("Comparison methods found in review text")
-            _bar(pd.DataFrame([{"label": r["label"], "count": r["count"]} for r in methods]))
+            bar_chart(methods)
         else:
             st.info("No explicit comparison-method mentions in the stored reviews.")
+    if rows:
+        st.dataframe(
+            [{"factor": r["label"], "frequency": r["count"], "percentage": r["percentage"]} for r in rows],
+            hide_index=True,
+            width="stretch",
+        )
+        _view_evidence(rows[0].get("review_ids"), title="View supporting reviews")
     _insight(pm_insight(topic="comparison factor", rows=rows or methods, analyzed=analyzed))
+    social = data.get("social") or []
+    if social:
+        st.caption("Trust & social validation (evidence-supported only)")
+        donut_chart(social)
 
 
 def _external(data: dict, analyzed: int) -> None:
-    st.markdown('<div class="section-h">9. EXTERNAL INFORMATION SEEKING</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-h">12. EXTERNAL INFORMATION SEEKING</div>', unsafe_allow_html=True)
     rows = data["external"]
     if not rows:
         st.info("Insufficient evidence for this visualization.")
         _insight(pm_insight(topic="external information seeking", rows=[], analyzed=analyzed))
         return
-    _bar(pd.DataFrame([{"label": r["label"], "count": r["count"]} for r in rows]))
+    left, right = st.columns(2)
+    with left:
+        bar_chart(rows)
+    with right:
+        donut_chart(rows)
+    st.dataframe(
+        [{"source": r["label"], "frequency": r["count"], "percentage": r["percentage"]} for r in rows],
+        hide_index=True,
+        width="stretch",
+    )
+    _view_evidence(rows[0].get("review_ids"), title="View supporting reviews")
     _insight(pm_insight(topic="external information seeking", rows=rows, analyzed=analyzed))
 
 
@@ -709,7 +955,7 @@ def _social(data: dict, analyzed: int) -> None:
 
 
 def _opportunities(data: dict, analyzed: int) -> None:
-    st.markdown('<div class="section-h">11. OPPORTUNITY MATRIX</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-h">13. OPPORTUNITY MATRIX</div>', unsafe_allow_html=True)
     st.caption("Score = reach × frequency × purchase impact × severity × evidence confidence. Calculated in Python.")
     opps = data["opps"]
     if not opps:
@@ -719,13 +965,11 @@ def _opportunities(data: dict, analyzed: int) -> None:
     st.markdown(f"**Top opportunity:** {top['name']} · score {top['score']} · {top['relevant_count']} reviews")
     left, right = st.columns(2)
     with left:
-        _scatter(
-            pd.DataFrame(
-                [
-                    {"frequency": o["frequency"], "impact": o["purchase_impact"], "count": o["relevant_count"]}
-                    for o in opps[:20]
-                ]
-            )
+        scatter_chart(
+            [
+                {"frequency": o["frequency"], "impact": o["purchase_impact"], "count": o["relevant_count"]}
+                for o in opps[:20]
+            ]
         )
     with right:
         st.dataframe(
@@ -733,6 +977,7 @@ def _opportunities(data: dict, analyzed: int) -> None:
                 {
                     "rank": o["rank"],
                     "opportunity": o["name"],
+                    "root_cause": o["name"],
                     "reach": o["reach"],
                     "frequency": o["frequency"],
                     "impact": o["purchase_impact"],
@@ -754,11 +999,15 @@ def _opportunities(data: dict, analyzed: int) -> None:
             extra=top.get("why_investigate") or "",
         )
     )
+    _view_evidence(top.get("evidence_ids"), title="View supporting reviews")
 
 
 def _decomposition(data: dict) -> None:
-    st.markdown('<div class="section-h">12. WISHLIST → PURCHASE METRIC DECOMPOSITION</div>', unsafe_allow_html=True)
-    st.caption("Evidence-based behavioral decomposition from public reviews — not an internal Myntra funnel.")
+    st.markdown('<div class="section-h">14. WISHLIST → PURCHASE METRIC DECOMPOSITION</div>', unsafe_allow_html=True)
+    st.caption(
+        "Public reviews cannot measure actual wishlist-to-purchase conversion. "
+        "First-party event data is required for the actual business KPI."
+    )
     signals = data["signals"]
     abandoned = next((r["count"] for r in data["purchase_signals"] if r["label"] == "abandoned"), 0)
     intent = next(
@@ -774,12 +1023,79 @@ def _decomposition(data: dict) -> None:
         uncertainties=data["uncertainties"][0]["count"] if data["uncertainties"] else 0,
         abandoned=abandoned,
     )
+    funnel = [
+        {
+            "stage": "Wishlist Intent",
+            "behavior": "Save / wishlist language in reviews",
+            "friction": "Unclear whether bookmarking or purchase intent",
+            "evidence": signals.get("wishlist_signal") or 0,
+            "first_party_needed": "wishlist_add events",
+        },
+        {
+            "stage": "Product Revisit",
+            "behavior": "Delayed / later language",
+            "friction": "No session revisit telemetry in public reviews",
+            "evidence": next((r["count"] for r in (data.get("purchase_beh") or []) if "Delayed" in r["label"]), 0),
+            "first_party_needed": "product_view after wishlist",
+        },
+        {
+            "stage": "Information Confidence",
+            "behavior": "Uncertainties extracted from analysis",
+            "friction": "Fit, size, quality, returns questions",
+            "evidence": data["uncertainties"][0]["count"] if data["uncertainties"] else 0,
+            "first_party_needed": "PDP help / size-guide interactions",
+        },
+        {
+            "stage": "Purchase Consideration",
+            "behavior": "Named barriers + comparison",
+            "friction": "Price, fit, quality, alternatives",
+            "evidence": (data["barriers"][0]["count"] if data["barriers"] else 0),
+            "first_party_needed": "add_to_bag / compare events",
+        },
+        {
+            "stage": "Decision",
+            "behavior": "Purchase hesitation labels",
+            "friction": "Postponement / abandoned intent",
+            "evidence": signals.get("purchase_hesitation") or 0,
+            "first_party_needed": "checkout start",
+        },
+        {
+            "stage": "Purchase",
+            "behavior": "purchase_signal purchased / abandoned",
+            "friction": "Public reviews are not orders",
+            "evidence": next((r["count"] for r in data["purchase_signals"] if r["label"] == "purchased"), 0),
+            "first_party_needed": "order_completed + wishlist attribution",
+        },
+    ]
     present = [s for s in stages if s["count"]]
     if present:
-        _bar(pd.DataFrame([{"label": s["stage"], "count": s["count"]} for s in present]))
+        bar_chart([{"label": s["stage"], "count": s["count"]} for s in present])
     else:
         st.info("Insufficient evidence for this visualization.")
+    st.dataframe(funnel, hide_index=True, width="stretch")
     st.dataframe(stages, hide_index=True, width="stretch")
+
+
+def _discovery_questions(data: dict, analyzed: int) -> None:
+    st.markdown('<div class="section-h">15. AI DISCOVERY QUESTIONS</div>', unsafe_allow_html=True)
+    st.caption("Answers are generated from stored analysis and original review text. Quotes are never invented.")
+    db = _db()
+    try:
+        cards = answer_discovery_questions(db, data, analyzed=analyzed)
+    finally:
+        db.close()
+    for card in cards:
+        with st.expander(card["question"], expanded=False):
+            st.markdown("**AI ANSWER**")
+            st.write(card["answer"])
+            st.markdown("**EVIDENCE SUMMARY**")
+            st.write(card["evidence_summary"])
+            st.write("Evidence count:", card["evidence_count"])
+            st.write("Supporting themes:", ", ".join(card["themes"]) if card["themes"] else "—")
+            st.write("Supporting review IDs:", ", ".join(str(i) for i in card["review_ids"]) if card["review_ids"] else "—")
+            st.write("Confidence / evidence strength:", card.get("confidence") if card.get("confidence") is not None else "—")
+            _view_evidence(card.get("review_ids"), title="Representative evidence")
+    _discovery_report(data, analyzed)
 
 
 def _discovery_report(data: dict, analyzed: int) -> None:
@@ -812,7 +1128,7 @@ def _discovery_report(data: dict, analyzed: int) -> None:
 
 
 def _evidence_explorer(source: str, rating: str, since, data: dict) -> None:
-    st.markdown('<div class="section-h">14. EVIDENCE EXPLORER</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-h">17. EVIDENCE EXPLORER</div>', unsafe_allow_html=True)
     q = st.text_input("Search original review text")
     theme_names = [t["name"] for t in data["themes"]]
     problem_names = [p["problem"] for p in data["problems"]]
@@ -883,8 +1199,8 @@ def _evidence_explorer(source: str, rating: str, since, data: dict) -> None:
 
 
 def _chatbot(analyzed: int) -> None:
-    st.markdown('<div class="section-h">🤖 AI PRODUCT MANAGER ASSISTANT</div>', unsafe_allow_html=True)
-    st.caption("Answers use retrieved database evidence only. The API key is never shown.")
+    st.markdown('<div class="section-h">16. AI DISCOVERY ASSISTANT</div>', unsafe_allow_html=True)
+    st.caption("Retrieves stored reviews and analysis first. Does not send the full corpus. The API key is never shown.")
     pick = st.selectbox("Suggested questions", ["(type your own)"] + SUGGESTED_QUESTIONS)
     question = st.text_input("Ask about wishlist → purchase evidence", value="" if pick == "(type your own)" else pick)
     if st.button("Ask") and question.strip():
@@ -893,11 +1209,13 @@ def _chatbot(analyzed: int) -> None:
             result = ask_product_assistant(db, question.strip(), analyzed=analyzed)
         finally:
             db.close()
+        st.markdown("**Answer**")
         st.write(result["answer"])
+        st.write("Evidence count:", result["supporting_review_count"])
+        st.write("Supporting themes:", ", ".join(result.get("themes") or []) or "—")
+        st.write("Review IDs:", ", ".join(str(i) for i in (result.get("review_ids") or [])) or "—")
+        st.write("Confidence:", result.get("confidence") if result.get("confidence") is not None else "—")
         st.caption(result["evidence_summary"])
-        st.write("Supporting reviews:", result["supporting_review_count"])
-        if result.get("themes"):
-            st.write("Themes:", ", ".join(result["themes"]))
         st.write("PM implication:", result["pm_implication"])
         for quote in result.get("quotes") or []:
             st.markdown(f"“{quote['text']}”")
@@ -905,17 +1223,16 @@ def _chatbot(analyzed: int) -> None:
 
 
 def _limitations() -> None:
-    st.markdown('<div class="section-h">DATA LIMITATIONS</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-h">19. DATA LIMITATIONS</div>', unsafe_allow_html=True)
     st.markdown(
         """
         <div class="limit-card">
-        Reviews are public feedback, not the complete Myntra customer base.
-        Public reviews do not directly expose actual wishlist → purchase conversion events.
-        Demographic information is generally unavailable.
-        Behavioral segments are inferred only from textual evidence.
-        Apple/Google availability depends on public source feeds.
-        Near-real-time means periodic refresh, not true event streaming.
-        Small samples should not be generalized to the full user base.
+        Public reviews are not the complete Myntra customer base.
+        Public reviews do not directly expose wishlist or purchase events.
+        Demographics are generally unavailable unless provided by a separate survey dataset.
+        Behavioral segments are inferred from textual evidence.
+        Near-real-time means periodic refresh from public sources.
+        Small samples should not be generalized to the entire user base.
         </div>
         """,
         unsafe_allow_html=True,
@@ -923,30 +1240,30 @@ def _limitations() -> None:
 
 
 def _collection_history() -> None:
-    with st.expander("Collection history"):
-        db = _db()
-        try:
-            rows = db.query(CollectionRun).order_by(CollectionRun.id.desc()).limit(15).all()
-            if not rows:
-                st.info("No collection runs recorded yet.")
-                return
-            st.dataframe(
-                [
-                    {
-                        "id": r.id,
-                        "sources": r.sources,
-                        "mode": r.mode,
-                        "new": r.new_count,
-                        "status": r.status,
-                        "finished": r.finished_at.isoformat() if r.finished_at else None,
-                    }
-                    for r in rows
-                ],
-                hide_index=True,
-                width="stretch",
-            )
-        finally:
-            db.close()
+    st.markdown('<div class="section-h">18. COLLECTION HISTORY</div>', unsafe_allow_html=True)
+    db = _db()
+    try:
+        rows = db.query(CollectionRun).order_by(CollectionRun.id.desc()).limit(15).all()
+        if not rows:
+            st.info("No collection runs recorded yet.")
+            return
+        st.dataframe(
+            [
+                {
+                    "id": r.id,
+                    "sources": r.sources,
+                    "mode": r.mode,
+                    "new": r.new_count,
+                    "status": r.status,
+                    "finished": r.finished_at.isoformat() if r.finished_at else None,
+                }
+                for r in rows
+            ],
+            hide_index=True,
+            width="stretch",
+        )
+    finally:
+        db.close()
 
 
 def _pipeline_status_panel() -> None:

@@ -103,18 +103,22 @@ def answer_from_evidence(question: str, evidence: dict[str, Any], *, analyzed: i
     themes = evidence.get("themes") or []
     if analyzed <= 0 and not reviews:
         return {
-            "answer": "There is insufficient evidence in the current review dataset to answer this reliably.",
+            "answer": "I don't have enough evidence in the collected review dataset to answer this reliably.",
             "evidence_summary": "No analyzed reviews are stored.",
             "supporting_review_count": 0,
             "themes": [],
+            "review_ids": [],
+            "confidence": None,
             "pm_implication": "Collect and analyze real reviews before drawing product conclusions.",
         }
     if not reviews and not problems and not opportunities:
         return {
-            "answer": "There is insufficient evidence in the current review dataset to answer this reliably.",
+            "answer": "I don't have enough evidence in the collected review dataset to answer this reliably.",
             "evidence_summary": f"{analyzed} reviews are analyzed, but none matched this question.",
             "supporting_review_count": 0,
             "themes": [t.get("name") for t in themes],
+            "review_ids": [],
+            "confidence": None,
             "pm_implication": "Try a more specific term that appears in stored barriers, problems, or review text.",
         }
 
@@ -147,6 +151,11 @@ def answer_from_evidence(question: str, evidence: dict[str, Any], *, analyzed: i
         ),
         "supporting_review_count": len(reviews),
         "themes": [t.get("name") for t in themes][:6],
+        "review_ids": [r["id"] for r in reviews],
+        "confidence": round(
+            sum(1 for r in reviews if r.get("root_cause") or r.get("barriers")) / max(1, len(reviews)) * 5,
+            2,
+        ) if reviews else None,
         "pm_implication": (
             "Inspect the retrieved reviews before treating this as a company-wide pattern. "
             "This is discovery evidence, not a recommended feature."
